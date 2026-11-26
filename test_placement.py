@@ -3,7 +3,7 @@ from threading import Barrier, Event, Thread
 from unittest import TestCase
 
 from demo import run
-from placement import Demand, Lease, Pool, Worker
+from placement import Booking, Demand, Lease, Pool, Worker
 
 
 class PlacementTest(TestCase):
@@ -464,3 +464,386 @@ class DrainTest(TestCase):
             self.assertIs(pool.current("second"), second)
             # All holds returned; only the original source occupancy remains.
             self.assertEqual(pool.available(), {"src": (2, 2), "z-dst": (4, 4)})
+
+
+class TimedSchedulingTest(TestCase):
+    def test_future_promises_constrain_ordinary_leases_and_expiry_fences_names(self):
+        pool = Pool([Worker("one", 5, 6)])
+        first = pool.book("first", Demand(4, 1), 2, 4)
+        second = pool.book("second", Demand(1, 5), 4, 6)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+
+        # At t=4 the disjoint promises need (1, 7) memory in aggregate, so an
+        # indefinite (1, 2) lease is unsafe even though t=0 looks empty.
+        self.assertIsNone(pool.reserve("ordinary", Demand(1, 2)))
+
+        third = pool.book("third", Demand(1, 1), 2, 6)
+        self.assertIsNotNone(third)
+        self.assertIsNone(pool.book("tight", Demand(1, 1), 3, 5))
+        self.assertIsNone(pool.reserve("tiny", Demand(1, 1)))
+        # Future bookings are not deducted from current availability.
+        self.assertEqual(pool.available(), {"one": (5, 6)})
+
+        pool.advance(4)
+        # The started-but-unactivated second and third bookings already hold.
+        self.assertEqual(pool.available(), {"one": (3, 0)})
+        self.assertIsNone(pool.activate(first))
+
+        second_lease = pool.activate(second)
+        third_lease = pool.activate(third)
+        self.assertIsNotNone(second_lease)
+        self.assertIsNotNone(third_lease)
+        self.assertIs(pool.current("second"), second_lease)
+        self.assertIs(pool.current("third"), third_lease)
+        # Activation never deducts the same reservation twice.
+        self.assertEqual(pool.available(), {"one": (3, 0)})
+        self.assertIs(pool.activate(second), second_lease)
+
+        pool.advance(6)
+        self.assertEqual(pool.available(), {"one": (5, 6)})
+        self.assertIsNone(pool.current("second"))
+        self.assertIsNone(pool.current("third"))
+
+        replacement = pool.reserve("second", Demand(1, 1))
+        self.assertIsNotNone(replacement)
+        # The expired original lease cannot release the replacement occupancy.
+        self.assertFalse(pool.release(second_lease))
+        self.assertEqual(pool.available(), {"one": (4, 5)})
+        self.assertTrue(pool.release(replacement))
+        self.assertEqual(pool.available(), {"one": (5, 6)})
+
+    def test_ordinary_reserve_prefers_current_margin_only_among_safe_workers(self):
+        unsafe = Pool([Worker("a", 2, 2), Worker("b", 5, 6)])
+        self.assertIsNotNone(unsafe.book("full-a", Demand(2, 2), 2, 4))
+        lease = unsafe.reserve("long", Demand(1, 1))
+        self.assertEqual(lease.worker, "b")
+
+        safe = Pool([Worker("a", 2, 2), Worker("b", 5, 6)])
+        lease = safe.reserve("long", Demand(1, 1))
+        self.assertEqual(lease.worker, "a")
+
+    def test_booking_starting_at_current_time_is_reserved_before_activation(self):
+        pool = Pool([Worker("w", 2, 2)])
+        booking = pool.book("job", Demand(1, 1), 0, 2)
+        self.assertIsNone(pool.current("job"))
+        self.assertEqual(pool.available(), {"w": (1, 1)})
+        lease = pool.activate(booking)
+        self.assertEqual(pool.available(), {"w": (1, 1)})
+        pool.advance(2)
+        self.assertIsNone(pool.current("job"))
+        self.assertEqual(pool.available(), {"w": (2, 2)})
+
+    def test_booking_tie_uses_smallest_worker_name(self):
+        pool = Pool([Worker("z", 2, 2), Worker("a", 2, 2)])
+        booking = pool.book("job", Demand(1, 1), 1, 3)
+        self.assertEqual(booking.worker, "a")
+
+    def test_booking_identity_window_and_foreign_credentials(self):
+        pool = Pool([Worker("w", 4, 4)])
+        booking = pool.book("job", Demand(1, 1), 1, 3)
+        self.assertIsInstance(booking, Booking)
+        self.assertEqual((booking.job, booking.worker, booking.start, booking.end),
+                         ("job", "w", 1, 3))
+
+        with self.assertRaises(ValueError):
+            pool.activate(object())
+        forged = Booking("job", "w", 1, 3)
+        self.assertIsNone(pool.activate(forged))
+
+        other = Pool([Worker("w", 4, 4)])
+        foreign = other.book("job", Demand(1, 1), 1, 3)
+        self.assertIsNone(pool.activate(foreign))
+        self.assertIsNone(pool.activate(booking))
+
+        pool.advance(1)
+        lease = pool.activate(booking)
+        self.assertIsNotNone(lease)
+        self.assertIs(pool.activate(booking), lease)
+        self.assertTrue(pool.release(lease))
+        self.assertIsNone(pool.activate(booking))
+
+    def test_backfill_choice_must_match_runtime_and_capacity_consequences(self):
+        pool = Pool([
+            Worker("a", 4, 4, frozenset({"base", "staging"})),
+            Worker("b", 5, 4, frozenset({"base", "accel"})),
+        ])
+        booking = pool.book("future-a", Demand(3, 3), 4, 8)
+        lease, until = pool.backfill(
+            "backfill", Demand(2, 2, frozenset({"base"})), 3, 6,
+        )
+        accel = Demand(4, 3, frozenset({"accel"}))
+
+        if lease.worker == "a":
+            self.assertEqual(until, 4)
+            ordinary = pool.reserve("accel-job", accel)
+            self.assertIsNotNone(ordinary)
+            self.assertEqual(ordinary.worker, "b")
+        else:
+            self.assertEqual(lease.worker, "b")
+            self.assertEqual(until, 6)
+            self.assertIsNone(pool.reserve("accel-job", accel))
+
+        pool.advance(4)
+        booking_lease = pool.activate(booking)
+        self.assertIsNotNone(booking_lease)
+        self.assertEqual(pool.available()["a"], (1, 1))
+
+        if lease.worker == "a":
+            # [0, 4) is half-open: t=4 belongs to the booking, not backfill.
+            self.assertIsNone(pool.current("backfill"))
+            self.assertFalse(pool.release(lease))
+            self.assertEqual(pool.available()["a"], (1, 1))
+        else:
+            self.assertIs(pool.current("backfill"), lease)
+            self.assertEqual(pool.available()["b"], (3, 2))
+            self.assertIsNone(pool.reserve("accel-at-4", accel))
+            pool.advance(6)
+            self.assertIsNone(pool.current("backfill"))
+            self.assertFalse(pool.release(lease))
+            self.assertEqual(pool.available()["b"], (5, 4))
+            landed = pool.reserve("accel-after-6", accel)
+            self.assertIsNotNone(landed)
+            self.assertEqual(landed.worker, "b")
+
+    def test_forced_a_backfill_gap_minimum_and_earlier_start(self):
+        def build(start):
+            pool = Pool([
+                Worker("a", 4, 4, frozenset({"base", "staging"})),
+                Worker("b", 5, 4, frozenset({"base", "accel"})),
+            ])
+            long_lease = pool.reserve(
+                "accel-long", Demand(4, 3, frozenset({"accel"})),
+            )
+            self.assertEqual(long_lease.worker, "b")
+            booking = pool.book("future-a", Demand(3, 3), start, start + 4)
+            return pool, booking
+
+        pool, booking = build(4)
+        lease, until = pool.backfill(
+            "backfill", Demand(2, 2, frozenset({"base"})), 3, 6,
+        )
+        self.assertEqual(lease.worker, "a")
+        self.assertEqual(until, 4)
+        before = pool.available()
+        self.assertIsNone(pool.backfill(
+            "too-short", Demand(2, 2, frozenset({"base"})), 5, 6,
+        ))
+        self.assertEqual(pool.available(), before)
+
+        pool.advance(3)
+        self.assertIs(pool.current("backfill"), lease)
+        self.assertEqual(pool.available()["a"], (2, 2))
+        pool.advance(4)
+        self.assertIsNone(pool.current("backfill"))
+        self.assertIsNotNone(pool.activate(booking))
+        self.assertEqual(pool.available()["a"], (1, 1))
+        self.assertFalse(pool.release(lease))
+        pool.advance(8)
+        self.assertEqual(pool.available()["a"], (4, 4))
+
+        earlier, earlier_booking = build(3)
+        earlier_lease, earlier_until = earlier.backfill(
+            "backfill", Demand(2, 2, frozenset({"base"})), 3, 6,
+        )
+        self.assertEqual(earlier_lease.worker, "a")
+        self.assertEqual(earlier_until, 3)
+        earlier.advance(3)
+        self.assertIsNone(earlier.current("backfill"))
+        self.assertIsNotNone(earlier.activate(earlier_booking))
+        self.assertEqual(earlier.available()["a"], (1, 1))
+
+    def test_early_release_abandons_remaining_booking_window(self):
+        pool = Pool([Worker("w", 5, 6)])
+        booking = pool.book("job", Demand(2, 2), 2, 6)
+        pool.advance(2)
+        lease = pool.activate(booking)
+        self.assertEqual(pool.available(), {"w": (3, 4)})
+
+        pool.advance(3)
+        self.assertTrue(pool.release(lease))
+        self.assertEqual(pool.available(), {"w": (5, 6)})
+        self.assertIsNone(pool.activate(booking))
+        self.assertFalse(pool.release(lease))
+
+        # The formerly conflicting remainder is genuinely free again.
+        replacement = pool.book("job", Demand(5, 6), 3, 5)
+        self.assertIsNotNone(replacement)
+        replacement_lease = pool.activate(replacement)
+        self.assertEqual(pool.available(), {"w": (0, 0)})
+        pool.advance(5)
+        self.assertIsNone(pool.current("job"))
+        self.assertEqual(pool.available(), {"w": (5, 6)})
+        self.assertFalse(pool.release(replacement_lease))
+
+    def test_duplicate_job_is_rejected_across_all_three_ledger_entries(self):
+        pool = Pool([Worker("w", 4, 4)])
+        booking = pool.book("job", Demand(1, 1), 2, 4)
+        self.assertIsNotNone(booking)
+        with self.assertRaises(ValueError):
+            pool.reserve("job", Demand(1, 1))
+        with self.assertRaises(ValueError):
+            pool.book("job", Demand(1, 1), 4, 5)
+        with self.assertRaises(ValueError):
+            pool.backfill("job", Demand(1, 1), 1, 2)
+
+        pool.advance(4)
+        ordinary = pool.reserve("job", Demand(1, 1))
+        self.assertIsNotNone(ordinary)
+        with self.assertRaises(ValueError):
+            pool.book("job", Demand(1, 1), 4, 5)
+        with self.assertRaises(ValueError):
+            pool.backfill("job", Demand(1, 1), 1, 2)
+
+    def test_time_parameter_validation_and_backwards_clock(self):
+        pool = Pool([Worker("w", 4, 4)])
+        for bad_now in (-1, True, 1.0, "1"):
+            with self.assertRaises(ValueError):
+                pool.advance(bad_now)
+
+        pool.advance(2)
+        pool.advance(2)  # Equal advance is legal.
+        with self.assertRaises(ValueError):
+            pool.advance(1)
+
+        with self.assertRaises(ValueError):
+            pool.book(7, Demand(1, 1), 3, 4)
+        with self.assertRaises(ValueError):
+            pool.book("j", object(), 3, 4)
+        with self.assertRaises(ValueError):
+            pool.book("j", Demand(1, 1), True, 4)
+        with self.assertRaises(ValueError):
+            pool.book("j", Demand(1, 1), 3, True)
+        with self.assertRaises(ValueError):
+            pool.book("j", Demand(1, 1), 2, 2)
+        with self.assertRaises(ValueError):
+            pool.book("j", Demand(1, 1), 1, 2)  # Before current time 2.
+        with self.assertRaises(ValueError):
+            pool.book("j", Demand(1, 1), 2, 67)
+
+        for min_ticks, max_ticks in ((True, 2), (1, True), (0, 2),
+                                     (2, 1), (1, 65)):
+            with self.assertRaises(ValueError):
+                pool.backfill("bf", Demand(1, 1), min_ticks, max_ticks)
+
+    def test_timed_pool_scale_and_record_limit(self):
+        oversized = Pool([Worker(f"w{i}", 1, 1) for i in range(9)])
+        with self.assertRaises(ValueError):
+            oversized.book("timed", Demand(1, 1), 1, 2)
+        with self.assertRaises(ValueError):
+            oversized.backfill("timed", Demand(1, 1), 1, 2)
+        # Old admission keeps working without the timed scale restriction.
+        self.assertIsNotNone(oversized.reserve("ordinary", Demand(1, 1)))
+
+        tall = Pool([Worker("w", 65, 1)])
+        with self.assertRaises(ValueError):
+            tall.book("timed", Demand(1, 1), 1, 2)
+        with self.assertRaises(ValueError):
+            tall.backfill("timed", Demand(1, 1), 1, 2)
+        self.assertIsNotNone(tall.reserve("ordinary", Demand(1, 1)))
+
+        pool = Pool([Worker("w", 64, 64)])
+        bookings = []
+        for index in range(16):
+            booking = pool.book(f"b{index}", Demand(1, 1), 1, 2)
+            self.assertIsNotNone(booking)
+            bookings.append(booking)
+        # The 17th otherwise-feasible request hits the unfinished-record cap.
+        self.assertIsNone(pool.book("overflow", Demand(1, 1), 1, 2))
+        self.assertEqual(len(pool._timed), 16)
+
+        # Activation changes the lease state, not the timed-record count.
+        pool.advance(1)
+        self.assertIsNotNone(pool.activate(bookings[0]))
+        self.assertEqual(len(pool._timed), 16)
+        self.assertIsNone(pool.book("overflow-active", Demand(1, 1), 1, 2))
+
+        pool.advance(2)
+        self.assertEqual(len(pool._timed), 0)
+        self.assertIsNotNone(pool.book("after-expiry", Demand(1, 1), 2, 3))
+
+    def test_drain_is_busy_while_timed_records_exist_and_works_after_expiry(self):
+        pool = Pool([Worker("a-src", 4, 4), Worker("b-dst", 4, 4)])
+        ordinary = pool.reserve("ordinary", Demand(1, 1))
+        self.assertEqual(ordinary.worker, "a-src")
+        booking = pool.book("scheduled", Demand(1, 1), 2, 4)
+        self.assertEqual(booking.worker, "a-src")
+        calls = []
+
+        result = pool.drain(
+            "a-src", lambda old, target: calls.append((old.job, target)) or True,
+        )
+        self.assertEqual(result, {"status": "busy", "moved": {}})
+        self.assertEqual(calls, [])
+
+        # Busy timed drain did not close the source.
+        late = pool.reserve("late", Demand(1, 1))
+        self.assertEqual(late.worker, "a-src")
+        self.assertEqual(pool.drain("a-src", lambda *_: True)["status"], "busy")
+
+        pool.advance(4)
+        after_clear = pool.reserve("after-clear", Demand(1, 1))
+        self.assertEqual(after_clear.worker, "a-src")
+        result = pool.drain("a-src", lambda *_: True)
+        self.assertEqual(result["status"], "drained")
+        self.assertEqual(set(result["moved"]),
+                         {"ordinary", "late", "after-clear"})
+        self.assertFalse(pool.release(ordinary))
+        self.assertEqual(pool.available(),
+                         {"a-src": (4, 4), "b-dst": (1, 1)})
+
+    def test_timed_admission_raises_runtime_error_during_running_drain(self):
+        pool = Pool([Worker("src", 3, 3), Worker("dst", 4, 4)])
+        old_lease = pool.reserve("moving", Demand(1, 1))
+        entered = Event()
+        release_block = Event()
+        result = {}
+
+        def prepare(old, target):
+            entered.set()
+            release_block.wait(5)
+            return True
+
+        thread = Thread(target=lambda: result.update(
+            pool.drain("src", prepare),
+        ))
+        thread.start()
+        self.assertTrue(entered.wait(5))
+        try:
+            with self.assertRaises(RuntimeError):
+                pool.book("blocked-booking", Demand(1, 1), 1, 2)
+            with self.assertRaises(RuntimeError):
+                pool.backfill("blocked-backfill", Demand(1, 1), 1, 2)
+            with self.assertRaises(ValueError):
+                pool.book("bad-window", Demand(1, 1), 2, 1)
+        finally:
+            release_block.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+        self.assertEqual(result["status"], "drained")
+        self.assertEqual(pool._timed, [])
+        self.assertEqual(pool.available(), {"src": (3, 3), "dst": (3, 3)})
+        self.assertIs(pool.current("moving"), result["moved"]["moving"])
+        self.assertFalse(pool.release(old_lease))
+        # Timed admission works once the evacuation has finished.
+        self.assertIsNotNone(pool.book("after-drain", Demand(1, 1), 1, 2))
+
+    def test_concurrent_same_job_admission_has_single_winner(self):
+        pool = Pool([Worker("w", 64, 64)])
+        gate = Barrier(3)
+
+        def attempt(kind):
+            gate.wait(5)
+            try:
+                if kind == 0:
+                    return pool.book("same", Demand(1, 1), 1, 2) is not None
+                if kind == 1:
+                    return pool.backfill("same", Demand(1, 1), 1, 1) is not None
+                return pool.reserve("same", Demand(1, 1)) is not None
+            except ValueError:
+                return False
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            outcomes = list(executor.map(attempt, range(3)))
+        self.assertEqual(outcomes.count(True), 1)
