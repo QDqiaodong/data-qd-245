@@ -13,6 +13,11 @@ TIMED_DIMENSION_LIMIT = 64
 TIMED_HORIZON_LIMIT = 64
 MAX_TIMED_RECORDS = 16
 
+# Flexible permits have an additional, smaller admission envelope.
+PERMIT_WORKER_LIMIT = 6
+PERMIT_DIMENSION_LIMIT = 64
+MAX_PERMITS = 5
+
 
 def _labels(labels):
     return type(labels) is frozenset and all(type(label) is str and label for label in labels)
@@ -50,6 +55,17 @@ class Lease:
 
 
 @dataclass(frozen=True)
+class Permit:
+    """Immutable, worker-less admission choice.
+
+    A permit reserves no real capacity.  The pool accepts a claim only for the
+    exact original object; an equal-valued or forged ``Permit`` is not enough.
+    """
+
+    job: str
+
+
+@dataclass(frozen=True)
 class Booking:
     """Immutable credential for a future fixed-window placement."""
 
@@ -84,6 +100,17 @@ class _TimedRecord:
         self.holding = holding
 
 
+class _PermitRecord:
+    """One unclaimed permit and its one or two whole-demand options."""
+
+    __slots__ = ("permit", "job", "options")
+
+    def __init__(self, permit, job, options):
+        self.permit = permit
+        self.job = job
+        self.options = options
+
+
 class Pool:
     def __init__(self, workers):
         self._workers = {}
@@ -106,16 +133,23 @@ class Pool:
         self._hold_use = {name: [0, 0] for name in self._workers}
         self._timed = []
         self._timed_by_job = {}
+        # Unclaimed flexible permits.  _permits is the authoritative live set;
+        # _permit_by_job enforces the shared job-name namespace.
+        self._permits = []
+        self._permit_by_job = {}
 
     def reserve(self, job, demand):
         """Atomically reserve both dimensions, or return None without consuming either."""
         if type(job) is not str or not job or not isinstance(demand, Demand):
             raise ValueError("invalid job or demand")
         with self._lock:
-            if job in self._active or job in self._timed_by_job:
+            if (job in self._active or job in self._timed_by_job
+                    or job in self._permit_by_job):
                 raise ValueError("job already has an active reservation")
+            safety_check = self._permit_safety_checker_locked(self._permits)
+            free_state = self._flat_free_locked()
             candidates = []
-            for name, (cpu, memory) in self._free.items():
+            for index, (name, (cpu, memory)) in enumerate(self._free.items()):
                 if name in self._closed:
                     continue
                 if not (demand.labels <= self._workers[name].labels):
@@ -126,6 +160,10 @@ class Pool:
                 # every already-promised timed interval.
                 if not self._indefinite_fits_locked(name, demand):
                     continue
+                if self._permits:
+                    trial_free = self._trial_free_locked(free_state, index, demand)
+                    if not safety_check(trial_free):
+                        continue
                 candidates.append((cpu - demand.cpu, memory - demand.memory, name))
             if not candidates:
                 return None
@@ -137,6 +175,214 @@ class Pool:
             used[1] += demand.memory
             self._active[job] = lease, demand
             return lease
+
+    def admit(self, job, options):
+        """Issue a worker-less permit for one or two whole-demand choices.
+
+        The permit is granted only when the pool can remain safe after *any*
+        outstanding permit is claimed next with *any* of its legal options.
+        No real worker capacity is deducted here.
+        """
+        if type(job) is not str or not job:
+            raise ValueError("invalid job")
+        if not isinstance(options, tuple) or not 1 <= len(options) <= 2:
+            raise ValueError("options must be a tuple of one or two Demands")
+        if any(not isinstance(option, Demand) for option in options):
+            raise ValueError("every option must be a Demand")
+        if len(self._workers) > PERMIT_WORKER_LIMIT:
+            raise ValueError("permits support at most 6 workers")
+        if any(worker.cpu > PERMIT_DIMENSION_LIMIT
+               or worker.memory > PERMIT_DIMENSION_LIMIT
+               for worker in self._workers.values()):
+            raise ValueError("permit pools support at most 64 units per dimension")
+        if any(option.cpu > PERMIT_DIMENSION_LIMIT
+               or option.memory > PERMIT_DIMENSION_LIMIT
+               for option in options):
+            raise ValueError("each permit option may request at most 64 units per dimension")
+
+        permit = Permit(job)
+        with self._lock:
+            if (job in self._active or job in self._timed_by_job
+                    or job in self._permit_by_job):
+                raise ValueError("job already has an active reservation or permit")
+            # Permits are only for non-timed work and do not participate in a
+            # drain's prepare phase.  Validation/duplicate errors win first.
+            if self._timed or self._draining:
+                return None
+            if len(self._permits) >= MAX_PERMITS:
+                return None
+
+            record = _PermitRecord(permit, job, options)
+            if not self._permits_fulfillable_locked(self._permits + [record]):
+                return None
+
+            self._permits.append(record)
+            self._permit_by_job[job] = record
+            return permit
+
+    def claim(self, permit, option):
+        """Claim the exact current permit and one legal option as a Lease."""
+        if not isinstance(permit, Permit):
+            raise ValueError("expected Permit")
+        with self._lock:
+            record = self._find_permit_record_locked(permit)
+            if record is None:
+                return None
+            # Option validation applies only to a live original permit and must
+            # reject bool even though bool is a subclass of int.
+            if type(option) is not int or not 0 <= option < len(record.options):
+                raise ValueError("invalid permit option")
+
+            demand = record.options[option]
+            remaining = [item for item in self._permits if item is not record]
+            safety_check = self._permit_safety_checker_locked(remaining)
+            free_state = self._flat_free_locked()
+            candidates = []
+            for index, (name, (cpu, memory)) in enumerate(self._free.items()):
+                if name in self._closed:
+                    continue
+                if not (demand.labels <= self._workers[name].labels):
+                    continue
+                if demand.cpu > cpu or demand.memory > memory:
+                    continue
+                if remaining:
+                    trial_free = self._trial_free_locked(free_state, index, demand)
+                    if not safety_check(trial_free):
+                        continue
+                candidates.append((
+                    cpu - demand.cpu,
+                    memory - demand.memory,
+                    name,
+                ))
+
+            # Admission maintains the recursive invariant, so every legal
+            # option has at least one such worker when its claim acquires the
+            # lock.  No state has been changed by the search above.
+            if not candidates:
+                raise RuntimeError("permit guarantee could not be fulfilled")
+            cpu_after, memory_after, name = min(candidates)
+
+            lease = Lease(record.job, name)
+            self._free[name] = (cpu_after, memory_after)
+            used = self._ordinary_use[name]
+            used[0] += demand.cpu
+            used[1] += demand.memory
+            self._active[record.job] = (lease, demand)
+            self._permits.remove(record)
+            if self._permit_by_job.get(record.job) is record:
+                del self._permit_by_job[record.job]
+            return lease
+
+    def cancel_permit(self, permit):
+        """Cancel the exact current unclaimed permit; return whether it was live."""
+        if not isinstance(permit, Permit):
+            raise ValueError("expected Permit")
+        with self._lock:
+            record = self._find_permit_record_locked(permit)
+            if record is None:
+                return False
+            self._permits.remove(record)
+            if self._permit_by_job.get(record.job) is record:
+                del self._permit_by_job[record.job]
+            return True
+
+    def _find_permit_record_locked(self, permit):
+        # Exact object identity is mandatory; same-field forged, foreign and
+        # stale permits never match a current record.
+        for record in self._permits:
+            if record.permit is permit:
+                return record
+        return None
+
+    def _flat_free_locked(self):
+        return tuple(
+            value
+            for cpu_memory in self._free.values()
+            for value in cpu_memory
+        )
+
+    @staticmethod
+    def _trial_free_locked(free, index, demand):
+        trial = list(free)
+        at = 2 * index
+        trial[at] -= demand.cpu
+        trial[at + 1] -= demand.memory
+        return tuple(trial)
+
+    def _permits_fulfillable_locked(self, records, free=None):
+        if not records:
+            return True
+        if free is None:
+            free = self._flat_free_locked()
+        check = self._permit_safety_checker_locked(records)
+        return check(free)
+
+    def _permit_safety_checker_locked(self, records):
+        """Build an exact recursive online-fulfillment predicate.
+
+        A state is safe iff, for every permit that could act next and every
+        option it could choose, the pool has *some* whole-worker placement
+        after which the remaining permits are still safe in the reduced state.
+        """
+        if not records:
+            return lambda _free: True
+
+        option_sets = []
+        for record in records:
+            options = []
+            for demand in record.options:
+                eligible = tuple(
+                    index
+                    for index, name in enumerate(self._workers)
+                    if name not in self._closed
+                    and demand.labels <= self._workers[name].labels
+                )
+                options.append((demand.cpu, demand.memory, eligible))
+            option_sets.append(tuple(options))
+
+        count = len(records)
+        memo = {}
+
+        def feasible(mask, free):
+            if mask == 0:
+                return True
+            cache_key = (mask, free)
+            cached = memo.get(cache_key)
+            if cached is not None:
+                return cached
+
+            remaining_mask = mask
+            while remaining_mask:
+                bit = remaining_mask & -remaining_mask
+                index = bit.bit_length() - 1
+
+                # Universal over the next holder's legal option.
+                for cpu_need, memory_need, eligible in option_sets[index]:
+                    found_worker = False
+                    # Existential over the pool's immediate whole-worker choice.
+                    for worker_index in eligible:
+                        at = 2 * worker_index
+                        free_cpu = free[at]
+                        free_memory = free[at + 1]
+                        if cpu_need > free_cpu or memory_need > free_memory:
+                            continue
+                        trial = list(free)
+                        trial[at] = free_cpu - cpu_need
+                        trial[at + 1] = free_memory - memory_need
+                        if feasible(mask ^ bit, tuple(trial)):
+                            found_worker = True
+                            break
+                    if not found_worker:
+                        memo[cache_key] = False
+                        return False
+
+                remaining_mask ^= bit
+
+            memo[cache_key] = True
+            return True
+
+        full_mask = (1 << count) - 1
+        return lambda free: feasible(full_mask, free)
 
     def advance(self, now):
         """Advance logical time and atomically settle reached interval ends."""
@@ -185,8 +431,11 @@ class Pool:
                 raise ValueError("booking window must satisfy now <= start < end")
             if end > self._now + TIMED_HORIZON_LIMIT:
                 raise ValueError("booking end is beyond the supported horizon")
-            if job in self._active or job in self._timed_by_job:
+            if (job in self._active or job in self._timed_by_job
+                    or job in self._permit_by_job):
                 raise ValueError("job already has a reservation")
+            if self._permits:
+                raise RuntimeError("cannot create timed work while permits are outstanding")
             if self._draining:
                 raise RuntimeError("cannot create timed work while drain is running")
             if len(self._timed) >= MAX_TIMED_RECORDS:
@@ -253,8 +502,11 @@ class Pool:
             raise ValueError("invalid backfill tick bounds")
         self._check_timed_pool_limits()
         with self._lock:
-            if job in self._active or job in self._timed_by_job:
+            if (job in self._active or job in self._timed_by_job
+                    or job in self._permit_by_job):
                 raise ValueError("job already has a reservation")
+            if self._permits:
+                raise RuntimeError("cannot create timed work while permits are outstanding")
             if self._draining:
                 raise RuntimeError("cannot create timed work while drain is running")
             if len(self._timed) >= MAX_TIMED_RECORDS:
@@ -439,9 +691,10 @@ class Pool:
             )
             if len(source_jobs) > DRAIN_SOURCE_JOB_LIMIT:
                 raise ValueError("drain source has more than 6 active jobs")
-            if self._draining or self._timed:
-                # Timed promises are not migrated by this evacuation. A legal
-                # request is busy and must not close the source or run prepare.
+            if self._draining or self._timed or self._permits:
+                # Timed promises and outstanding choice permits are not
+                # migrated by this evacuation. A legal request is busy and must
+                # not close the source or run prepare.
                 return {"status": "busy", "moved": {}}
 
             # The attempt starts here: the source stops accepting new jobs and

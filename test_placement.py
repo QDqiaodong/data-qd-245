@@ -3,7 +3,7 @@ from threading import Barrier, Event, Thread
 from unittest import TestCase
 
 from demo import run
-from placement import Booking, Demand, Lease, Pool, Worker
+from placement import Booking, Demand, Lease, Permit, Pool, Worker
 
 
 class PlacementTest(TestCase):
@@ -847,3 +847,335 @@ class TimedSchedulingTest(TestCase):
         with ThreadPoolExecutor(max_workers=3) as executor:
             outcomes = list(executor.map(attempt, range(3)))
         self.assertEqual(outcomes.count(True), 1)
+
+
+class PermitAdmissionTest(TestCase):
+    @staticmethod
+    def _two_unique_workers():
+        return Pool([
+            Worker("a", 4, 4, frozenset({"a-only"})),
+            Worker("b", 4, 4, frozenset({"b-only"})),
+        ])
+
+    def test_static_arrangement_does_not_imply_online_permit(self):
+        pool = Pool([
+            Worker("a", 2, 2, frozenset({"a-only"})),
+            Worker("b", 2, 2, frozenset({"b-only"})),
+        ])
+        both = (
+            Demand(2, 2, frozenset({"a-only"})),
+            Demand(2, 2, frozenset({"b-only"})),
+        )
+        g_permit = pool.admit("g", both)
+        self.assertIsInstance(g_permit, Permit)
+        self.assertEqual(g_permit.job, "g")
+        self.assertIsNone(pool.current("g"))
+        self.assertEqual(pool.available(), {"a": (2, 2), "b": (2, 2)})
+
+        # If g's worker were known, f could use the other worker.  But f may
+        # claim first, so admitting f would leave one of g's legal options dead.
+        self.assertIsNone(pool.admit("f", (Demand(1, 1),)))
+        self.assertIsNone(pool.reserve("f", Demand(1, 1)))
+        self.assertEqual(pool.available(), {"a": (2, 2), "b": (2, 2)})
+
+        self.assertTrue(pool.cancel_permit(g_permit))
+        direct = pool.reserve("f", Demand(1, 1))
+        self.assertIsNotNone(direct)
+        # Equal residual margins preserve the original smallest-name preference.
+        self.assertEqual(direct.worker, "a")
+
+    def test_removing_one_contingency_lets_reserve_choose_safe_worker(self):
+        pool = Pool([
+            Worker("a", 2, 2, frozenset({"a-only"})),
+            Worker("b", 2, 2, frozenset({"b-only"})),
+        ])
+        g_permit = pool.admit(
+            "g", (Demand(2, 2, frozenset({"a-only"})),),
+        )
+        f_lease = pool.reserve("f", Demand(1, 1))
+        self.assertEqual(f_lease.worker, "b")
+        g_lease = pool.claim(g_permit, 0)
+        self.assertEqual(g_lease.worker, "a")
+        self.assertEqual(pool.available(), {"a": (0, 0), "b": (1, 1)})
+
+    def test_first_claim_worker_choice_changes_which_direct_request_is_safe(self):
+        pool = self._two_unique_workers()
+        g_permit = pool.admit("g", (
+            Demand(2, 1, frozenset({"a-only"})),
+            Demand(1, 2, frozenset({"b-only"})),
+        ))
+        f_permit = pool.admit("f", (Demand(2, 2),))
+        f_lease = pool.claim(f_permit, 0)
+        self.assertIn(f_lease.worker, ("a", "b"))
+
+        a_request = Demand(1, 2, frozenset({"a-only"}))
+        b_request = Demand(2, 1, frozenset({"b-only"}))
+        if f_lease.worker == "a":
+            # It physically fits the residual on a, but would kill g's option 0.
+            before = pool.available()
+            self.assertIsNone(pool.reserve("a-job", a_request))
+            self.assertEqual(pool.available(), before)
+            accepted = pool.reserve("b-job", b_request)
+            self.assertIsNotNone(accepted)
+            self.assertEqual(accepted.worker, "b")
+            self.assertIsNone(pool.reserve("a-after", a_request))
+        else:
+            before = pool.available()
+            self.assertIsNone(pool.reserve("b-job", b_request))
+            self.assertEqual(pool.available(), before)
+            accepted = pool.reserve("a-job", a_request)
+            self.assertIsNotNone(accepted)
+            self.assertEqual(accepted.worker, "a")
+            self.assertIsNone(pool.reserve("b-after", b_request))
+
+        # The recursive promise to g remains redeemable for either option.
+        g_lease = pool.claim(g_permit, 0)
+        self.assertIsNotNone(g_lease)
+        self.assertEqual(g_lease.worker, "a")
+
+        for lease in (f_lease, accepted, g_lease):
+            self.assertTrue(pool.release(lease))
+        self.assertEqual(pool.available(), {"a": (4, 4), "b": (4, 4)})
+
+    def test_each_named_option_lands_on_its_labelled_worker_and_releases_all(self):
+        expected = {
+            0: ("a", (2, 3), (4, 4)),
+            1: ("b", (4, 4), (3, 2)),
+        }
+        for option, (worker, a_free, b_free) in expected.items():
+            pool = self._two_unique_workers()
+            g_permit = pool.admit("g", (
+                Demand(2, 1, frozenset({"a-only"})),
+                Demand(1, 2, frozenset({"b-only"})),
+            ))
+            f_permit = pool.admit("f", (Demand(2, 2),))
+
+            g_lease = pool.claim(g_permit, option)
+            self.assertIsNotNone(g_lease)
+            self.assertEqual(g_lease.worker, worker)
+            self.assertEqual(pool.current("g"), g_lease)
+            self.assertEqual(pool.available(), {"a": a_free, "b": b_free})
+
+            before_f = pool.available()
+            f_lease = pool.claim(f_permit, 0)
+            self.assertIsNotNone(f_lease)
+            cpu, memory = before_f[f_lease.worker]
+            self.assertEqual(
+                pool.available()[f_lease.worker], (cpu - 2, memory - 2),
+            )
+            self.assertTrue(pool.release(f_lease))
+            self.assertTrue(pool.release(g_lease))
+            self.assertEqual(pool.available(), {"a": (4, 4), "b": (4, 4)})
+
+    def test_concurrent_claims_of_same_original_permit_have_one_winner(self):
+        pool = Pool([Worker("w", 3, 3)])
+        permit = pool.admit("same", (Demand(1, 2), Demand(2, 1)))
+        gate = Barrier(2)
+        outcomes = {}
+
+        def claim(option):
+            gate.wait(5)
+            outcomes[option] = pool.claim(permit, option)
+
+        threads = [Thread(target=claim, args=(option,)) for option in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+
+        leases = [lease for lease in outcomes.values() if lease is not None]
+        self.assertEqual(len(leases), 1)
+        lease = leases[0]
+        self.assertEqual(lease.worker, "w")
+        self.assertIs(pool.current("same"), lease)
+        self.assertIn(pool.available(), [{"w": (2, 1)}, {"w": (1, 2)}])
+        self.assertTrue(pool.release(lease))
+        self.assertEqual(pool.available(), {"w": (3, 3)})
+        self.assertIsNone(pool.claim(permit, 0))
+
+    def test_stale_forged_foreign_and_reissued_credentials_are_fenced(self):
+        pool = Pool([Worker("w", 3, 3)])
+        old = pool.admit("job", (Demand(1, 2), Demand(2, 1)))
+        self.assertTrue(pool.cancel_permit(old))
+
+        forged = Permit("job")
+        other = Pool([Worker("w", 3, 3)])
+        foreign = other.admit("job", (Demand(1, 1),))
+
+        new = pool.admit("job", (Demand(1, 1), Demand(2, 1)))
+        self.assertIsNone(pool.claim(old, 0))
+        self.assertFalse(pool.cancel_permit(old))
+        self.assertIsNone(pool.claim(forged, 0))
+        self.assertFalse(pool.cancel_permit(forged))
+        self.assertIsNone(pool.claim(foreign, 0))
+        self.assertFalse(pool.cancel_permit(foreign))
+
+        with self.assertRaises(ValueError):
+            pool.claim(new, -1)
+        with self.assertRaises(ValueError):
+            pool.claim(new, 2)
+        with self.assertRaises(ValueError):
+            pool.claim(new, True)
+        with self.assertRaises(ValueError):
+            pool.claim(new, "0")
+        # Validation failures do not consume the live permit.
+        lease = pool.claim(new, 0)
+        self.assertIsNotNone(lease)
+        self.assertIsNone(pool.claim(new, 1))
+        self.assertFalse(pool.cancel_permit(new))
+        self.assertTrue(pool.release(lease))
+
+        reissued = pool.admit("job", (Demand(1, 1),))
+        self.assertIsNone(pool.claim(new, 0))
+        self.assertFalse(pool.cancel_permit(new))
+        self.assertTrue(pool.cancel_permit(reissued))
+
+        with self.assertRaises(ValueError):
+            pool.claim(object(), 0)
+        with self.assertRaises(ValueError):
+            pool.cancel_permit(object())
+
+    def test_permit_is_frozen_and_has_no_worker_or_time_fields(self):
+        permit = Pool([Worker("w", 1, 1)]).admit("job", (Demand(1, 1),))
+        self.assertEqual(permit.job, "job")
+        self.assertFalse(hasattr(permit, "worker"))
+        self.assertFalse(hasattr(permit, "start"))
+        with self.assertRaises(AttributeError):
+            permit.job = "other"
+
+    def test_closed_worker_is_not_available_for_permit_redemption(self):
+        pool = self._two_unique_workers()
+        self.assertEqual(
+            pool.drain("a", lambda *_: True)["status"], "drained",
+        )
+        # Option 0 can only use closed worker a, so the two-option permit is
+        # not redeemable for every legal option.
+        self.assertIsNone(pool.admit("g", (
+            Demand(1, 1, frozenset({"a-only"})),
+            Demand(1, 1, frozenset({"b-only"})),
+        )))
+        permit = pool.admit("h", (Demand(1, 1, frozenset({"b-only"})),))
+        lease = pool.claim(permit, 0)
+        self.assertEqual(lease.worker, "b")
+
+    def test_permit_has_no_time_or_automatic_expiry(self):
+        pool = Pool([Worker("w", 1, 1)])
+        permit = pool.admit("job", (Demand(1, 1),))
+        pool.advance(10_000)
+        lease = pool.claim(permit, 0)
+        self.assertIsNotNone(lease)
+        self.assertEqual(pool.current("job"), lease)
+
+    def test_admit_validation_scale_and_five_permit_limit(self):
+        pool = Pool([Worker("w", 64, 64)])
+        with self.assertRaises(ValueError):
+            pool.admit("no-options", ())
+        with self.assertRaises(ValueError):
+            pool.admit("three", (Demand(1, 1),) * 3)
+        with self.assertRaises(ValueError):
+            pool.admit("a-list", [Demand(1, 1)])
+        with self.assertRaises(ValueError):
+            pool.admit("bad-option", (Demand(1, 1), object()))
+        with self.assertRaises(ValueError):
+            pool.admit("too-big", (Demand(65, 1),))
+        with self.assertRaises(ValueError):
+            pool.admit("too-big-mem", (Demand(1, 65),))
+        self.assertIsNotNone(pool.admit("edge", (Demand(64, 64),)))
+        with self.assertRaises(ValueError):
+            pool.reserve("edge", Demand(1, 1))
+
+        seven = Pool([Worker(f"w{i}", 1, 1) for i in range(7)])
+        with self.assertRaises(ValueError):
+            seven.admit("too-many-workers", (Demand(1, 1),))
+        # The new permit envelope does not constrain the old reserve entry.
+        self.assertIsNotNone(seven.reserve("old-reserve", Demand(1, 1)))
+
+        tall = Pool([Worker("w", 65, 64)])
+        with self.assertRaises(ValueError):
+            tall.admit("tall", (Demand(1, 1),))
+        self.assertIsNotNone(tall.reserve("old-reserve", Demand(1, 1)))
+
+        limited = Pool([Worker(f"w{i}", 64, 64) for i in range(6)])
+        permits = [
+            limited.admit(f"p{i}", (Demand(1, 1),))
+            for i in range(5)
+        ]
+        self.assertTrue(all(permits))
+        self.assertIsNone(limited.admit("sixth", (Demand(1, 1),)))
+        self.assertTrue(limited.cancel_permit(permits[0]))
+        self.assertIsNotNone(limited.admit("sixth", (Demand(1, 1),)))
+
+    def test_duplicate_name_is_rejected_across_permits_leases_and_timed(self):
+        pool = Pool([Worker("w", 4, 4)])
+        permit = pool.admit("job", (Demand(1, 1),))
+        with self.assertRaises(ValueError):
+            pool.admit("job", (Demand(1, 1),))
+        with self.assertRaises(ValueError):
+            pool.reserve("job", Demand(1, 1))
+        with self.assertRaises(ValueError):
+            pool.book("job", Demand(1, 1), 1, 2)
+        with self.assertRaises(ValueError):
+            pool.backfill("job", Demand(1, 1), 1, 1)
+
+        lease = pool.claim(permit, 0)
+        with self.assertRaises(ValueError):
+            pool.admit("job", (Demand(1, 1),))
+        self.assertTrue(pool.release(lease))
+        replacement = pool.admit("job", (Demand(1, 1),))
+        self.assertIsNotNone(replacement)
+
+    def test_timed_entries_and_running_drain_block_admit_but_not_validation(self):
+        timed_pool = Pool([Worker("w", 4, 4)])
+        self.assertIsNotNone(timed_pool.book("future", Demand(1, 1), 1, 2))
+        self.assertIsNone(timed_pool.admit("permit-job", (Demand(1, 1),)))
+        self.assertEqual(timed_pool.available(), {"w": (4, 4)})
+
+        pool = Pool([Worker("src", 4, 4), Worker("dst", 4, 4)])
+        moving = pool.reserve("moving", Demand(1, 1))
+        source = moving.worker
+        entered = Event()
+        release_prepare = Event()
+
+        def prepare(_old, _target):
+            entered.set()
+            release_prepare.wait(5)
+            return True
+
+        result = {}
+        thread = Thread(target=lambda: result.update(
+            pool.drain(source, prepare),
+        ))
+        thread.start()
+        self.assertTrue(entered.wait(5))
+        try:
+            self.assertIsNone(pool.admit("during-prepare", (Demand(1, 1),)))
+        finally:
+            release_prepare.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["status"], "drained")
+
+    def test_outstanding_permits_block_timed_and_drain_without_closing_worker(self):
+        pool = Pool([Worker("w", 4, 4)])
+        permit = pool.admit("choice", (Demand(1, 1), Demand(2, 1)))
+        self.assertIsNotNone(permit)
+
+        with self.assertRaises(RuntimeError):
+            pool.book("booked", Demand(1, 1), 1, 2)
+        with self.assertRaises(RuntimeError):
+            pool.backfill("filled", Demand(1, 1), 1, 1)
+        # Parameter and duplicate-name ValueErrors retain their priority.
+        with self.assertRaises(ValueError):
+            pool.book("bad-window", Demand(1, 1), 2, 1)
+        with self.assertRaises(ValueError):
+            pool.backfill("bad-ticks", Demand(1, 1), True, 1)
+        with self.assertRaises(ValueError):
+            pool.book("choice", Demand(1, 1), 1, 2)
+
+        result = pool.drain("w", lambda *_: True)
+        self.assertEqual(result, {"status": "busy", "moved": {}})
+        # Busy returned before closing w.
+        ordinary = pool.reserve("ordinary", Demand(1, 1))
+        self.assertIsNotNone(ordinary)
+        self.assertEqual(ordinary.worker, "w")
