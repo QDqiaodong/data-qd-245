@@ -14,6 +14,9 @@
   **原对象**领用或取消；详见下文“不指定工位的准入许可”。
 - `Booking(job, worker, start, end)`：固定窗口预约成功后返回的不可变凭据；
   激活时同样只接受池当时发出的**原对象**，不接受同字段伪造品。
+- `GroupTicket(jobs)`：跨故障域成组预约返回的不可变凭据。只含按副本顺序排列的
+  作业名元组，没有工位或时刻；激活时同样按**对象身份**围栏，伪造品、外池凭据和
+  已失效凭据都不能领用。
 
 ## 基础入口
 
@@ -181,6 +184,92 @@ lease, until = pool.backfill(
 - 作业名、`Demand`、标签规则与 `reserve` 相同；时刻和时长必须是真正的 `int`，
   `bool` 不会被当作整数。类型错误、重名或越界抛 `ValueError`，且不改变池状态。
 
+## 跨故障域成组预约与工位停接
+
+这两类入口共享一套更小的离线规模边界：池内至多 **4** 台工位，结束点不晚于
+`当前时刻 + 32`；至多 **2** 批有效成组预约（含已开工但未结束的批次）和 **4** 个
+未结束的停接窗口。超出数量上限的合法请求返回 `None`；参数非法抛 `ValueError`
+且无副作用。所有时刻必须是真正的 `int`，`bool` 不被接受。
+
+### 故障域配置
+
+```python
+pool = Pool(
+    [Worker("a", 4, 4), Worker("b", 4, 4)],
+    fault_domains={"a": "rack-A", "b": "rack-B"},
+)
+```
+
+- `fault_domains` 是工位名到故障域名的**完整映射**：必须恰好覆盖每台工位，域名
+  为非空字符串，否则构造抛 `ValueError`。
+- 不提供该参数时旧接口原样工作；`book_group` 属于需要故障域的新用法，在未配置的
+  池上调用抛 `ValueError`。`schedule_stop` 不依赖故障域。
+
+### 成组预约：book_group / activate_group
+
+```python
+ticket = pool.book_group(
+    (
+        ("replica-x", Demand(2, 2, frozenset({"x-label"}))),
+        ("replica-y", Demand(2, 2, frozenset({"y-label"}))),
+    ),
+    start=5,
+    end=8,
+)
+# 每批 2-3 个 (作业名, Demand) 元组，按返回顺序排列；整批在同一个 [start, end)
+# 内运行，每个副本各占一台固定工位，且工位的故障域两两互异。
+# 成功返回本池凭据 GroupTicket；不存在整组联合安排时返回 None。
+
+pool.activate_group(ticket)     # now < start：提前领用返回 None 且不消费
+pool.advance(5)
+leases = pool.activate_group(ticket)
+# (Lease("replica-x", ...), Lease("replica-y", ...))，按副本顺序一次性发放
+```
+
+- **逐副本都有位置不等于整组可运行。** 选工位是带回溯的联合搜索：每个副本匹配
+  标签和两维容量、整段窗口逐刻度可容纳，同时工位互不相同且故障域两两互异；任一
+  条件找不到完整联合方案就整组拒绝，不写入任何记录、余额与作业名均不变。
+- `start` 必须严格晚于当前时刻（`start > now`），`start < end <= now + 32`。
+  未到开工点时未来允诺**不预扣** `available()`；进入窗口后即使尚未领用也已预留
+  容量，与旧 `book` 的到窗预留一致。
+- 到准确开工 tick 调用 `activate_group(ticket)` 才一次发放整批原 `Lease` 元组；
+  任一副本开不了工就一份都不发。提前领用返回 `None` 且不消费；跳过开工点后未
+  领用的凭据失效，不再约束后来的申请并释放作业名与批次名额。
+- 有效凭据重复领用返回仍有效的**同一批租约对象**；任一副本被 `release` 提前
+  归还或到期结束后，整批不再重新开工。伪造、外池或非 `GroupTicket` 对象分别
+  返回 `None` 或抛 `ValueError`。
+- 成组副本与普通租约、旧 `book`、`backfill`、`Permit` 共用作业名命名空间；
+  副本记录同时计入旧的 16 条定时记录上限。
+
+### 工位停接：schedule_stop
+
+```python
+window = pool.schedule_stop("c", earliest=5, latest=8, duration=2)
+# 在闭区间 [earliest, latest] 内选择一个整 tick 作为开始；
+# 成功返回不变元组 (实际开始, 实际结束)（半开区间），否则返回 None。
+```
+
+- 承诺窗口内该工位不得有任何尚存的执行或预约占用，也不接新单（`reserve`、
+  `book`、`backfill`、成组副本都会绕开或拒绝），但**别的工位照常工作**。
+- 同一工位的两个停接窗口不能重叠；区间端点相接允许。已确认的窗口不会因后来的
+  申请挪动：范围内存在多个合法开始时刻时任选其一（当前实现取最早可行时刻），
+  不考虑尚未提出的请求。
+- 普通 `reserve` 没有截止时刻，不能被放到一台已承诺停接的工位上（即使当前
+  空闲）；旧的有截止时刻短作业（`book` / `backfill`）仍按原规则选取停接之前
+  可交付的连续片段。
+- 停接请求会被工位上**无截止时刻的普通租约**阻止（返回 `None`），因为这类租约
+  没有可等待的结束点；定时作业到点结束后即可安排。`earliest >= now`、时长为正，
+  结束点不晚于 `now + 32`。
+
+### 与旧定时入口的兼容边界
+
+- 尚有未领用 `Permit` 或正在疏散（`drain`）时，不能创建成组预约或停接：沿用旧
+  定时入口的口径抛 `RuntimeError`（参数本身非法时仍先抛 `ValueError`）。
+- 存在有效成组预约或停接承诺时，`admit` 不能发新许可（返回 `None`），`drain`
+  按旧定时工作返回 `busy` 且不关闭源工位。
+- 这些新承诺全部结束后，旧预约、回填、许可、疏散行为完全不变。所有新入口都在
+  原有池锁内原子完成，不接外部调度器，也不搬动已开工的作业。
+
 ## 维护疏散：pool.drain(worker, prepare)
 
 在工位 `worker` 下线前，把开始疏散时仍在它上面的活跃作业整批交接给其他工位。
@@ -268,4 +357,6 @@ while True:
 
 ```bash
 python3 -B -m unittest -v
+# 只运行跨故障域成组预约与工位停接的验收场景（含简短中文执行摘要）：
+python3 -B -m unittest -v test_group_maintenance
 ```

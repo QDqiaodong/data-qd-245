@@ -18,6 +18,15 @@ PERMIT_WORKER_LIMIT = 6
 PERMIT_DIMENSION_LIMIT = 64
 MAX_PERMITS = 5
 
+# Fault-domain group bookings and maintenance stop windows share one small,
+# offline-testable envelope.
+GROUP_WORKER_LIMIT = 4
+GROUP_REPLICA_MIN = 2
+GROUP_REPLICA_MAX = 3
+MAX_GROUP_BOOKINGS = 2
+MAX_STOP_WINDOWS = 4
+GROUP_HORIZON_LIMIT = 32
+
 
 def _labels(labels):
     return type(labels) is frozenset and all(type(label) is str and label for label in labels)
@@ -75,8 +84,19 @@ class Booking:
     end: int
 
 
+@dataclass(frozen=True)
+class GroupTicket:
+    """Immutable credential for one fault-domain-separated replica batch.
+
+    Only the exact object issued by the pool can be activated; an equal-valued
+    or forged ticket never matches a live group.
+    """
+
+    jobs: tuple
+
+
 class _TimedRecord:
-    """One live booking or backfill interval.
+    """One live booking, backfill or group-replica interval.
 
     The pool lock guards every instance and the ``holding`` flag records whether
     the interval's demand is currently deducted from ``Pool._free``.
@@ -84,11 +104,11 @@ class _TimedRecord:
 
     __slots__ = (
         "kind", "job", "demand", "worker", "start", "end",
-        "booking", "lease", "holding",
+        "booking", "lease", "holding", "group",
     )
 
     def __init__(self, kind, job, demand, worker, start, end,
-                 booking=None, lease=None, holding=False):
+                 booking=None, lease=None, holding=False, group=None):
         self.kind = kind
         self.job = job
         self.demand = demand
@@ -98,6 +118,33 @@ class _TimedRecord:
         self.booking = booking
         self.lease = lease
         self.holding = holding
+        self.group = group
+
+
+class _GroupRecord:
+    """One accepted replica batch and its live per-replica timed records."""
+
+    __slots__ = ("ticket", "replicas", "start", "end", "leases")
+
+    def __init__(self, ticket, replicas, start, end):
+        self.ticket = ticket
+        # Replica records in the same order as the book_group argument.
+        self.replicas = replicas
+        self.start = start
+        self.end = end
+        # Lease objects in replica order, filled at the first activation.
+        self.leases = None
+
+
+class _StopRecord:
+    """One committed worker maintenance window ``[start, end)``."""
+
+    __slots__ = ("worker", "start", "end")
+
+    def __init__(self, worker, start, end):
+        self.worker = worker
+        self.start = start
+        self.end = end
 
 
 class _PermitRecord:
@@ -112,7 +159,7 @@ class _PermitRecord:
 
 
 class Pool:
-    def __init__(self, workers):
+    def __init__(self, workers, *, fault_domains=None):
         self._workers = {}
         self._free = {}
         for worker in workers:
@@ -120,6 +167,19 @@ class Pool:
                 raise ValueError("duplicate worker")
             self._workers[worker.name] = worker
             self._free[worker.name] = (worker.cpu, worker.memory)
+        # Optional complete worker-name -> fault-domain-name mapping.  When
+        # present it enables group bookings; every name must be a non-empty
+        # string and every worker must be covered exactly once.
+        self._fault_domains = None
+        if fault_domains is not None:
+            if not isinstance(fault_domains, dict):
+                raise ValueError("fault_domains must be a mapping")
+            if set(fault_domains) != set(self._workers):
+                raise ValueError("fault_domains must cover every worker exactly once")
+            if any(type(domain) is not str or not domain
+                   for domain in fault_domains.values()):
+                raise ValueError("fault domain names must be non-empty strings")
+            self._fault_domains = dict(fault_domains)
         self._active = {}
         self._lock = Lock()
         # Workers that no longer accept new jobs (sources of drain attempts).
@@ -137,6 +197,10 @@ class Pool:
         # _permit_by_job enforces the shared job-name namespace.
         self._permits = []
         self._permit_by_job = {}
+        # Live replica batches (including activated ones until every replica
+        # interval ends) and committed maintenance windows.
+        self._groups = []
+        self._stops = []
 
     def reserve(self, job, demand):
         """Atomically reserve both dimensions, or return None without consuming either."""
@@ -207,7 +271,7 @@ class Pool:
                 raise ValueError("job already has an active reservation or permit")
             # Permits are only for non-timed work and do not participate in a
             # drain's prepare phase.  Validation/duplicate errors win first.
-            if self._timed or self._draining:
+            if self._timed or self._groups or self._stops or self._draining:
                 return None
             if len(self._permits) >= MAX_PERMITS:
                 return None
@@ -417,6 +481,14 @@ class Pool:
                     self._deduct_current_locked(record.worker, record.demand)
                     record.holding = True
 
+            # Maintenance windows hold no capacity of their own; reaching the
+            # end simply releases the worker back to ordinary scheduling.
+            self._stops = [stop for stop in self._stops if stop.end > now]
+
+            # A group stops constraining the pool once every replica interval
+            # has ended or been released.
+            self._sweep_groups_locked()
+
             self._now = now
 
     def book(self, job, demand, start, end):
@@ -491,6 +563,217 @@ class Pool:
             record.lease = lease
             self._active[record.job] = (lease, record.demand)
             return lease
+
+    def book_group(self, replicas, start, end):
+        """Book one batch of 2-3 same-window replicas on distinct fault domains.
+
+        ``replicas`` is a tuple of ``(job, Demand)`` pairs in return order.
+        Every replica occupies one fixed, labelled worker for the whole
+        half-open ``[start, end)`` window, and the chosen workers must carry
+        pairwise different fault domains.  A per-replica placement is not
+        enough: the whole batch is accepted only when one joint assignment
+        exists.  Returns the pool's original ``GroupTicket`` or ``None``.
+        """
+        if self._fault_domains is None:
+            raise ValueError("group bookings require fault_domains configuration")
+        if not isinstance(replicas, tuple) or not (
+            GROUP_REPLICA_MIN <= len(replicas) <= GROUP_REPLICA_MAX
+        ):
+            raise ValueError("replicas must be a tuple of 2 or 3 (job, Demand) pairs")
+        jobs = []
+        demands = []
+        for pair in replicas:
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise ValueError("each replica must be a (job, Demand) pair")
+            job, demand = pair
+            if type(job) is not str or not job or not isinstance(demand, Demand):
+                raise ValueError("invalid replica job or demand")
+            jobs.append(job)
+            demands.append(demand)
+        if type(start) is not int or type(end) is not int:
+            raise ValueError("start and end must be integers")
+        if not (start < end):
+            raise ValueError("booking window must satisfy start < end")
+        if start <= self._now:
+            raise ValueError("group bookings must start strictly after now")
+        if end > self._now + GROUP_HORIZON_LIMIT:
+            raise ValueError("booking end is beyond the supported horizon")
+
+        with self._lock:
+            if len(self._workers) > GROUP_WORKER_LIMIT:
+                return None
+            if len(self._groups) >= MAX_GROUP_BOOKINGS:
+                return None
+            if self._permits:
+                raise RuntimeError("cannot create timed work while permits are outstanding")
+            if self._draining:
+                raise RuntimeError("cannot create timed work while drain is running")
+            if len(self._timed) + len(replicas) > MAX_TIMED_RECORDS:
+                return None
+            if len(set(jobs)) != len(jobs):
+                raise ValueError("duplicate replica job in group")
+            if any(job in self._active or job in self._timed_by_job
+                   or job in self._permit_by_job for job in jobs):
+                raise ValueError("job already has a reservation")
+
+            assignment = self._plan_group_locked(demands, start, end)
+            if assignment is None:
+                return None
+
+            ticket = GroupTicket(tuple(jobs))
+            group = _GroupRecord(ticket, [], start, end)
+            records = []
+            for (job, demand), name in zip(replicas, assignment):
+                record = _TimedRecord(
+                    "group", job, demand, name, start, end, group=group,
+                )
+                # start > now by validation, so nothing is deducted yet.
+                self._timed.append(record)
+                self._timed_by_job[job] = record
+                records.append(record)
+            group.replicas = records
+            self._groups.append(group)
+            return ticket
+
+    def _plan_group_locked(self, demands, start, end):
+        """Backtracking joint assignment: never reject a feasible batch."""
+        assignment = []
+        used_workers = set()
+        used_domains = set()
+
+        def search(index):
+            if index == len(demands):
+                return True
+            demand = demands[index]
+            for name in sorted(self._workers):
+                if name in self._closed or name in used_workers:
+                    continue
+                worker = self._workers[name]
+                if not (demand.labels <= worker.labels):
+                    continue
+                domain = self._fault_domains[name]
+                if domain in used_domains:
+                    continue
+                if not self._interval_fits_locked(name, demand, start, end):
+                    continue
+                used_workers.add(name)
+                used_domains.add(domain)
+                assignment.append(name)
+                if search(index + 1):
+                    return True
+                assignment.pop()
+                used_domains.remove(domain)
+                used_workers.remove(name)
+            return False
+
+        return tuple(assignment) if search(0) else None
+
+    def activate_group(self, ticket):
+        """Issue the whole batch's original Leases at exactly its start tick.
+
+        Returns a tuple of ``Lease`` objects in replica order, or ``None`` for
+        early, late, forged, foreign or already-finished tickets.  Repeating a
+        valid activation while every member is live returns the same leases.
+        """
+        if not isinstance(ticket, GroupTicket):
+            raise ValueError("expected GroupTicket")
+        with self._lock:
+            group = self._find_group_locked(ticket)
+            if group is None:
+                return None
+            if not (group.start <= self._now < group.end):
+                return None
+            if group.leases is not None:
+                # A member that was released or expired means the batch can
+                # never be started again as a whole.
+                for record, lease in zip(group.replicas, group.leases):
+                    current = self._active.get(record.job)
+                    if current is None or current[0] is not lease:
+                        return None
+                return tuple(group.leases)
+
+            leases = []
+            for record in group.replicas:
+                if not record.holding:
+                    self._deduct_current_locked(record.worker, record.demand)
+                    record.holding = True
+                lease = Lease(record.job, record.worker)
+                record.lease = lease
+                self._active[record.job] = (lease, record.demand)
+                leases.append(lease)
+            group.leases = leases
+            return tuple(leases)
+
+    def _find_group_locked(self, ticket):
+        # Object identity, exactly like Booking/Permit fencing.
+        for group in self._groups:
+            if group.ticket is ticket:
+                return group
+        return None
+
+    def _sweep_groups_locked(self):
+        self._groups = [
+            group for group in self._groups
+            if any(record in self._timed for record in group.replicas)
+        ]
+
+    def schedule_stop(self, worker, earliest, latest, duration):
+        """Commit one maintenance window for ``worker`` inside [earliest, latest].
+
+        Returns the immutable tuple ``(actual_start, actual_end)`` for the
+        earliest feasible whole-tick start, or ``None`` when no window can be
+        honored.  Confirmed windows never move for later requests.
+        """
+        if type(worker) is not str or worker not in self._workers:
+            raise ValueError("unknown worker")
+        if (type(earliest) is not int or type(latest) is not int
+                or type(duration) is not int):
+            raise ValueError("stop bounds and duration must be integers")
+        if duration <= 0:
+            raise ValueError("stop duration must be positive")
+        if earliest < self._now:
+            raise ValueError("stop window cannot start before now")
+        if latest < earliest:
+            raise ValueError("latest must not precede earliest")
+        if earliest + duration > self._now + GROUP_HORIZON_LIMIT:
+            raise ValueError("stop window end is beyond the supported horizon")
+
+        with self._lock:
+            if len(self._workers) > GROUP_WORKER_LIMIT:
+                return None
+            if len(self._stops) >= MAX_STOP_WINDOWS:
+                return None
+            if self._permits:
+                raise RuntimeError("cannot schedule stops while permits are outstanding")
+            if self._draining:
+                raise RuntimeError("cannot schedule stops while drain is running")
+            # An indefinite ordinary lease has no end tick to wait out; it
+            # cannot coexist with a promised stop on the same worker.
+            for job, (lease, _demand) in self._active.items():
+                if lease.worker != worker:
+                    continue
+                if self._timed_by_job.get(job) is None:
+                    return None
+            latest_start = min(latest, self._now + GROUP_HORIZON_LIMIT - duration)
+            for start in range(earliest, latest_start + 1):
+                end = start + duration
+                if self._stop_fits_locked(worker, start, end):
+                    self._stops.append(_StopRecord(worker, start, end))
+                    return (start, end)
+            return None
+
+    def _stop_fits_locked(self, worker, start, end):
+        # Same-worker stop windows may not overlap; touching endpoints are fine.
+        for stop in self._stops:
+            if stop.worker == worker and start < stop.end and stop.start < end:
+                return False
+        # No surviving execution or reservation may occupy the worker inside
+        # the window.  Timed records include bookings, backfills and group
+        # replicas; ordinary leases were rejected separately in schedule_stop.
+        for record in self._timed:
+            if record.worker == worker and start < record.end and record.start < end:
+                return False
+        return True
 
     def backfill(self, job, demand, min_ticks, max_ticks):
         """Grant an immediate finite lease with the longest safe prefix found."""
@@ -573,6 +856,11 @@ class Pool:
         return None
 
     def _tick_fits_locked(self, name, demand, tick):
+        # A committed stop window rejects every new occupancy on that worker,
+        # regardless of remaining capacity; touching endpoints are allowed.
+        for stop in self._stops:
+            if stop.worker == name and stop.start <= tick < stop.end:
+                return False
         worker = self._workers[name]
         base_cpu = self._ordinary_use[name][0] + self._hold_use[name][0]
         base_memory = self._ordinary_use[name][1] + self._hold_use[name][1]
@@ -607,6 +895,10 @@ class Pool:
         for record in self._timed:
             if record.end > horizon:
                 horizon = record.end
+        # An indefinite lease cannot outlive a promised stop on its worker.
+        for stop in self._stops:
+            if stop.worker == name and stop.end > horizon:
+                horizon = stop.end
         for tick in range(self._now, horizon):
             if not self._tick_fits_locked(name, demand, tick):
                 return False
@@ -646,6 +938,8 @@ class Pool:
                 used[0] -= demand.cpu
                 used[1] -= demand.memory
             del self._active[lease.job]
+            # A replica release may be the last live member of its batch.
+            self._sweep_groups_locked()
             return True
 
     def available(self):
@@ -691,10 +985,11 @@ class Pool:
             )
             if len(source_jobs) > DRAIN_SOURCE_JOB_LIMIT:
                 raise ValueError("drain source has more than 6 active jobs")
-            if self._draining or self._timed or self._permits:
-                # Timed promises and outstanding choice permits are not
-                # migrated by this evacuation. A legal request is busy and must
-                # not close the source or run prepare.
+            if (self._draining or self._timed or self._permits
+                    or self._groups or self._stops):
+                # Timed promises, group bookings, stop windows and outstanding
+                # choice permits are not migrated by this evacuation. A legal
+                # request is busy and must not close the source or run prepare.
                 return {"status": "busy", "moved": {}}
 
             # The attempt starts here: the source stops accepting new jobs and
