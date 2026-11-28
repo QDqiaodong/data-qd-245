@@ -27,6 +27,18 @@ MAX_GROUP_BOOKINGS = 2
 MAX_STOP_WINDOWS = 4
 GROUP_HORIZON_LIMIT = 32
 
+# Batch-result handoff has its own small, offline-testable envelope.
+ARTIFACT_WORKER_LIMIT = 8
+ARTIFACT_DIMENSION_LIMIT = 64
+ARTIFACT_EXCHANGE_LIMIT = 64
+MAX_ARTIFACTS = 8
+MAX_ARTIFACT_READERS = 4
+MAX_READER_INPUTS = 4
+BLOCKS_PER_ARTIFACT_MIN = 1
+BLOCKS_PER_ARTIFACT_MAX = 8
+BLOCK_BYTES_MIN = 1
+BLOCK_BYTES_MAX = 64
+
 
 def _labels(labels):
     return type(labels) is frozenset and all(type(label) is str and label for label in labels)
@@ -95,6 +107,52 @@ class GroupTicket:
     jobs: tuple
 
 
+@dataclass(frozen=True, eq=False)
+class Artifact:
+    """Immutable credential for one published batch result.
+
+    A pool accepts an artifact only as the exact original object it issued.
+    Equal-valued or forged artifacts never match a live result, and the fields
+    carry no mutable location: the pool tracks where the blocks really live.
+    """
+
+    job: str
+
+
+class _ArtifactRecord:
+    """One live published result and its pending reader confirmations."""
+
+    __slots__ = ("artifact", "job", "blocks", "readers", "pending",
+                 "worker", "in_exchange")
+
+    def __init__(self, artifact, job, blocks, readers, worker):
+        self.artifact = artifact
+        self.job = job
+        self.blocks = blocks
+        # Ordered, unique reader job names that may still confirm this result.
+        self.readers = readers
+        # Reader names that have not yet confirmed successfully.
+        self.pending = set(readers)
+        # Worker whose memory currently carries the blocks, or None when the
+        # result has been moved into the shared exchange area.
+        self.worker = worker
+        self.in_exchange = worker is None
+
+
+class _ReaderRecord:
+    """One running downstream run borrowing artifacts plus local read holds."""
+
+    __slots__ = ("lease", "inputs", "local_holds", "artifact_records")
+
+    def __init__(self, lease, inputs, local_holds, artifact_records):
+        self.lease = lease
+        self.inputs = inputs
+        # artifact -> producing worker name whose local blocks are read-held.
+        self.local_holds = local_holds
+        # The live artifact records borrowed by this run, in request order.
+        self.artifact_records = artifact_records
+
+
 class _TimedRecord:
     """One live booking, backfill or group-replica interval.
 
@@ -159,7 +217,7 @@ class _PermitRecord:
 
 
 class Pool:
-    def __init__(self, workers, *, fault_domains=None):
+    def __init__(self, workers, *, fault_domains=None, exchange_blocks=None):
         self._workers = {}
         self._free = {}
         for worker in workers:
@@ -167,6 +225,16 @@ class Pool:
                 raise ValueError("duplicate worker")
             self._workers[worker.name] = worker
             self._free[worker.name] = (worker.cpu, worker.memory)
+        # Batch-result handoff is opt-in.  ``None`` disables it entirely;
+        # a real integer (including 0) enables it with that exchange capacity.
+        self._handoff_enabled = exchange_blocks is not None
+        self._exchange_capacity = 0
+        if exchange_blocks is not None:
+            if type(exchange_blocks) is not int:
+                raise ValueError("exchange_blocks must be an integer")
+            if not 0 <= exchange_blocks <= ARTIFACT_EXCHANGE_LIMIT:
+                raise ValueError("exchange_blocks is outside the supported range")
+            self._exchange_capacity = exchange_blocks
         # Optional complete worker-name -> fault-domain-name mapping.  When
         # present it enables group bookings; every name must be a non-empty
         # string and every worker must be covered exactly once.
@@ -201,6 +269,15 @@ class Pool:
         # interval ends) and committed maintenance windows.
         self._groups = []
         self._stops = []
+        # Live published artifacts by original credential.  Running readers
+        # are keyed by their current original lease object.
+        self._artifacts = {}
+        self._readers = {}
+        # Leases issued by ``reserve`` and still current; only these may
+        # publish a batch result.
+        self._reserve_leases = set()
+        # Blocks currently occupying the shared exchange area.
+        self._exchange_used = 0
 
     def reserve(self, job, demand):
         """Atomically reserve both dimensions, or return None without consuming either."""
@@ -238,6 +315,7 @@ class Pool:
             used[0] += demand.cpu
             used[1] += demand.memory
             self._active[job] = lease, demand
+            self._reserve_leases.add(lease)
             return lease
 
     def admit(self, job, options):
@@ -929,6 +1007,17 @@ class Pool:
             cpu, memory = self._free[lease.worker]
             self._free[lease.worker] = (cpu + demand.cpu, memory + demand.memory)
 
+            # A reader lease aborts only its own run: units return, its local
+            # read holds are dropped, but no borrowed result is confirmed.
+            reader = self._readers.pop(lease, None)
+            if reader is not None:
+                used = self._ordinary_use[lease.worker]
+                used[0] -= demand.cpu
+                used[1] -= demand.memory
+                del self._active[lease.job]
+                return True
+
+            self._reserve_leases.discard(lease)
             timed = self._timed_by_job.get(lease.job)
             if timed is not None and timed.lease is current_lease:
                 # Early release abandons the remainder of the fixed interval.
@@ -952,6 +1041,393 @@ class Pool:
         with self._lock:
             record = self._active.get(job)
             return None if record is None else record[0]
+
+    # ------------------------------------------------------------------
+    # Batch-result handoff: publish, start_reader, finish_reader.
+    # ------------------------------------------------------------------
+
+    def publish(self, lease, blocks, readers):
+        """Publish one batch result from a current raw ordinary lease.
+
+        ``blocks`` is a tuple of 1-8 immutable ``bytes`` objects (1-64 bytes
+        each); ``readers`` is a tuple of 1-4 distinct non-empty job names that
+        will confirm the result later.  Returns the pool's original
+        ``Artifact`` credential, or ``None`` for a legal request that cannot be
+        honored (stale/inapplicable lease, no free artifact slot, evacuation in
+        progress).  The producer is unbound: all CPU and the memory not used by
+        the finished blocks return to its worker, while the blocks stay in that
+        worker's memory until moved to the exchange or fully confirmed.
+        """
+        if not self._handoff_enabled:
+            raise RuntimeError("batch-result handoff is not enabled")
+        self._check_artifact_pool_limits()
+        if not isinstance(lease, Lease):
+            raise ValueError("expected Lease")
+        if not isinstance(blocks, tuple) or not (
+                BLOCKS_PER_ARTIFACT_MIN <= len(blocks) <= BLOCKS_PER_ARTIFACT_MAX):
+            raise ValueError("blocks must be a tuple of 1 to 8 bytes objects")
+        if any(type(block) is not bytes or not (
+                BLOCK_BYTES_MIN <= len(block) <= BLOCK_BYTES_MAX)
+                for block in blocks):
+            raise ValueError("every block must be immutable bytes of 1 to 64 bytes")
+        if not isinstance(readers, tuple) or not (
+                1 <= len(readers) <= MAX_ARTIFACT_READERS):
+            raise ValueError("readers must be a tuple of 1 to 4 job names")
+        if any(type(reader) is not str or not reader for reader in readers):
+            raise ValueError("reader names must be non-empty strings")
+        if len(set(readers)) != len(readers):
+            raise ValueError("reader names must be distinct")
+
+        with self._lock:
+            # Only the exact current lease issued by ``reserve`` may publish;
+            # timed, permit-claimed, reader and migrated leases are excluded.
+            record = self._active.get(lease.job)
+            if (record is None or record[0] is not lease
+                    or lease not in self._reserve_leases
+                    or lease in self._readers
+                    or self._timed_by_job.get(lease.job) is not None):
+                return None
+            _current_lease, demand = record
+            if len(blocks) > demand.memory:
+                raise ValueError("one result cannot exceed the producer's memory")
+            # A reader may wait on at most four results in total.  Reaching that
+            # wait cap is a capacity refusal, not a malformed request.
+            for reader in readers:
+                waiting = sum(1 for rec in self._artifacts.values()
+                              if reader in rec.pending)
+                if waiting + 1 > MAX_READER_INPUTS:
+                    return None
+            if self._draining:
+                return None
+            if len(self._artifacts) >= MAX_ARTIFACTS:
+                return None
+
+            worker = lease.worker
+            free_cpu, free_memory = self._free[worker]
+            self._free[worker] = (
+                free_cpu + demand.cpu,
+                free_memory + demand.memory - len(blocks),
+            )
+            used = self._ordinary_use[worker]
+            used[0] -= demand.cpu
+            used[1] -= demand.memory
+            used[1] += len(blocks)
+
+            del self._active[lease.job]
+            self._reserve_leases.discard(lease)
+            artifact = Artifact(lease.job)
+            artifact_record = _ArtifactRecord(
+                artifact, lease.job, tuple(blocks), tuple(readers), worker,
+            )
+            self._artifacts[artifact] = artifact_record
+            return artifact
+
+    def start_reader(self, job, demand, artifacts):
+        """Start a downstream reader over every currently pending result.
+
+        Returns ``(lease, inputs)`` where ``inputs`` are the block tuples in
+        ``artifacts`` order, or ``None`` when no legal arrangement exists.  To
+        make all inputs simultaneously readable on the chosen worker, required
+        local results may be moved wholesale into the shared exchange area (as
+        many as the exchange capacity allows); such a move is committed
+        atomically with the placement.
+        """
+        if not self._handoff_enabled:
+            raise RuntimeError("batch-result handoff is not enabled")
+        if type(job) is not str or not job or not isinstance(demand, Demand):
+            raise ValueError("invalid job or demand")
+        self._check_artifact_pool_limits()
+        if not isinstance(artifacts, tuple) or not artifacts:
+            raise ValueError("artifacts must be a non-empty tuple")
+        if any(not isinstance(artifact, Artifact) for artifact in artifacts):
+            raise ValueError("every input must be an Artifact")
+        if len(set(artifacts)) != len(artifacts):
+            raise ValueError("duplicate input artifact")
+        if len(artifacts) > MAX_READER_INPUTS:
+            raise ValueError("one reader may wait on at most four results")
+
+        with self._lock:
+            # The job name is exclusive with every other live binding; adding
+            # inputs to an already-reading job is therefore rejected here too.
+            if (job in self._active or job in self._timed_by_job
+                    or job in self._permit_by_job):
+                raise ValueError("job already has an active reservation")
+            if self._draining:
+                return None
+            # Every credential must be this pool's live original object.
+            records = []
+            for artifact in artifacts:
+                record = self._artifacts.get(artifact)
+                if record is None:
+                    return None
+                records.append(record)
+            # The call must carry exactly the job's whole pending set, and the
+            # job must be an authorized reader of every passed result.
+            if any(job not in rec.pending for rec in records):
+                return None
+            required = {rec.artifact for rec in self._artifacts.values()
+                        if job in rec.pending}
+            if required != set(artifacts):
+                return None
+
+            arrangement = self._plan_reader_locked(demand, records)
+            if arrangement is None:
+                return None
+            worker, plan = arrangement
+
+            # Commit: move this request's required local results wholesale,
+            # then place.  No other result is touched.
+            local_holds = {}
+            for record in records:
+                if record.in_exchange:
+                    continue
+                if plan[record.artifact] == "exchange":
+                    self._move_artifact_to_exchange_locked(record)
+                else:
+                    local_holds[record.artifact] = record.worker
+
+            # After the moves the real free/ordinary figures already match the
+            # simulated arrangement, so a plain deduction finalizes it.
+            self._deduct_current_locked(worker, demand)
+            used = self._ordinary_use[worker]
+            used[0] += demand.cpu
+            used[1] += demand.memory
+            lease = Lease(job, worker)
+            self._active[job] = (lease, demand)
+            self._readers[lease] = _ReaderRecord(
+                lease, tuple(rec.blocks for rec in records), local_holds,
+                tuple(records),
+            )
+            return lease, tuple(rec.blocks for rec in records)
+
+    def finish_reader(self, lease):
+        """Confirm one current original reader lease.
+
+        Returns ``True`` after returning the run's occupancy and confirming
+        every result it borrowed.  A result is deregistered and its space
+        returned only once its last registered reader confirms.  Any lease that
+        is not the current original run of this pool returns ``False``.
+        """
+        if not self._handoff_enabled:
+            raise RuntimeError("batch-result handoff is not enabled")
+        if not isinstance(lease, Lease):
+            raise ValueError("expected Lease")
+        with self._lock:
+            reader = self._readers.get(lease)
+            record = self._active.get(lease.job)
+            if (reader is None or record is None or record[0] is not lease):
+                return False
+            demand = record[1]
+            self._free[lease.worker] = (
+                self._free[lease.worker][0] + demand.cpu,
+                self._free[lease.worker][1] + demand.memory,
+            )
+            used = self._ordinary_use[lease.worker]
+            used[0] -= demand.cpu
+            used[1] -= demand.memory
+            del self._active[lease.job]
+            del self._readers[lease]
+            for artifact in reader.artifact_records:
+                artifact.pending.discard(lease.job)
+                if not artifact.pending:
+                    self._deregister_artifact_locked(artifact)
+            return True
+
+    def artifact_location(self, artifact):
+        """Where a live result's blocks currently live, or None if unknown."""
+        if not self._handoff_enabled:
+            return None
+        with self._lock:
+            record = self._artifacts.get(artifact) if isinstance(
+                artifact, Artifact) else None
+            if record is None:
+                return None
+            if record.in_exchange:
+                return ("exchange", None)
+            return ("local", record.worker)
+
+    def exchange_used(self):
+        """Number of exchange blocks actually occupied (0 when disabled)."""
+        if not self._handoff_enabled:
+            return 0
+        with self._lock:
+            return self._exchange_used
+
+    def _check_artifact_pool_limits(self):
+        if (len(self._workers) > ARTIFACT_WORKER_LIMIT
+                or any(worker.cpu > ARTIFACT_DIMENSION_LIMIT
+                       or worker.memory > ARTIFACT_DIMENSION_LIMIT
+                       for worker in self._workers.values())):
+            raise ValueError(
+                "handoff supports at most 8 workers and 64 units per dimension"
+            )
+
+    def _move_artifact_to_exchange_locked(self, record):
+        """Move all of one result's local blocks into the exchange area."""
+        worker = record.worker
+        blocks = len(record.blocks)
+        free_cpu, free_memory = self._free[worker]
+        self._free[worker] = (free_cpu, free_memory + blocks)
+        self._ordinary_use[worker][1] -= blocks
+        record.worker = None
+        record.in_exchange = True
+        self._exchange_used += blocks
+
+    def _deregister_artifact_locked(self, record):
+        """Release a confirmed result's space and forget the credential."""
+        if record.in_exchange:
+            self._exchange_used -= len(record.blocks)
+        else:
+            worker = record.worker
+            free_cpu, free_memory = self._free[worker]
+            self._free[worker] = (free_cpu, free_memory + len(record.blocks))
+            self._ordinary_use[worker][1] -= len(record.blocks)
+        self._artifacts.pop(record.artifact, None)
+
+    def _artifact_read_held_locked(self, artifact):
+        """Whether any running reader is locally reading *artifact* right now."""
+        return any(artifact in reader.local_holds
+                   for reader in self._readers.values())
+
+    def _plan_reader_locked(self, demand, records):
+        """Find one worker plus a legal local/exchange arrangement, or None.
+
+        The search uses the real post-transfer state: moving a result frees its
+        producer's memory and consumes exchange blocks.  Only results in this
+        request may move; no other result is relocated, no result is split and
+        no already-exchange result is moved back.
+        """
+        for name in sorted(self._workers):
+            if name in self._closed:
+                continue
+            if not (demand.labels <= self._workers[name].labels):
+                continue
+            plan = self._plan_reader_on_locked(name, demand, records)
+            if plan is not None:
+                return plan
+        return None
+
+    def _plan_reader_on_locked(self, name, demand, records):
+        # Mandatory decisions first.
+        mandatory_moved = []
+        optional_local = []
+        plan = {}
+        for record in records:
+            if record.in_exchange:
+                plan[record.artifact] = "exchange"
+                continue
+            if record.worker == name:
+                optional_local.append(record)
+            else:
+                plan[record.artifact] = "exchange"
+                mandatory_moved.append(record)
+
+        # Enumerate which local-on-target results (if any) also move over.
+        count = len(optional_local)
+        for mask in range(1 << count):
+            trial = dict(plan)
+            freed = {}
+            exchange_added = 0
+            read_held = False
+            for record in mandatory_moved:
+                if self._artifact_read_held_locked(record.artifact):
+                    read_held = True
+                    break
+                exchange_added += len(record.blocks)
+                freed[record.worker] = (
+                    freed.get(record.worker, 0) + len(record.blocks)
+                )
+            if read_held:
+                continue
+            for index, record in enumerate(optional_local):
+                if mask & (1 << index):
+                    if self._artifact_read_held_locked(record.artifact):
+                        read_held = True
+                        break
+                    trial[record.artifact] = "exchange"
+                    exchange_added += len(record.blocks)
+                    freed[name] = freed.get(name, 0) + len(record.blocks)
+                else:
+                    trial[record.artifact] = "local"
+            if read_held:
+                continue
+            if self._exchange_used + exchange_added > self._exchange_capacity:
+                continue
+
+            simulated_free = {
+                worker_name: [free_cpu, free_memory]
+                for worker_name, (free_cpu, free_memory) in self._free.items()
+            }
+            for worker_name, amount in freed.items():
+                simulated_free[worker_name][1] += amount
+
+            if (demand.cpu > simulated_free[name][0]
+                    or demand.memory > simulated_free[name][1]):
+                continue
+
+            simulated_ordinary = (
+                self._ordinary_use[name][0],
+                # Local blocks that move out are dropped from ordinary usage;
+                # blocks that stay local remain in that figure.
+                self._ordinary_use[name][1] - freed.get(name, 0),
+            )
+            if not self._indefinite_fits_sim_locked(
+                    name, demand, simulated_ordinary):
+                continue
+            if self._permits:
+                flat = tuple(
+                    value
+                    for worker_name in self._workers
+                    for value in simulated_free[worker_name]
+                )
+                trial_flat = list(flat)
+                at = 2 * list(self._workers).index(name)
+                trial_flat[at] -= demand.cpu
+                trial_flat[at + 1] -= demand.memory
+                if not self._permit_safety_checker_locked(
+                        self._permits)(tuple(trial_flat)):
+                    continue
+            return name, trial
+        return None
+
+    def _indefinite_fits_sim_locked(self, name, demand, simulated_ordinary):
+        """Indefinite-fit test with an adjusted ordinary-usage baseline."""
+        worker = self._workers[name]
+        base_cpu = (simulated_ordinary[0] + self._hold_use[name][0]
+                    + demand.cpu)
+        base_memory = (simulated_ordinary[1] + self._hold_use[name][1]
+                       + demand.memory)
+        if base_cpu > worker.cpu or base_memory > worker.memory:
+            return False
+        horizon = self._now
+        for record in self._timed:
+            if record.end > horizon:
+                horizon = record.end
+        for stop in self._stops:
+            if stop.worker == name and stop.end > horizon:
+                horizon = stop.end
+        for tick in range(self._now, horizon):
+            if not self._tick_fits_sim_locked(
+                    name, demand, simulated_ordinary, tick):
+                return False
+        return True
+
+    def _tick_fits_sim_locked(self, name, demand, simulated_ordinary, tick):
+        for stop in self._stops:
+            if stop.worker == name and stop.start <= tick < stop.end:
+                return False
+        worker = self._workers[name]
+        cpu = simulated_ordinary[0] + self._hold_use[name][0] + demand.cpu
+        memory = simulated_ordinary[1] + self._hold_use[name][1] + demand.memory
+        if cpu > worker.cpu or memory > worker.memory:
+            return False
+        for record in self._timed:
+            if record.worker == name and record.start <= tick < record.end:
+                cpu += record.demand.cpu
+                memory += record.demand.memory
+                if cpu > worker.cpu or memory > worker.memory:
+                    return False
+        return True
 
     def drain(self, worker, prepare):
         """Move every active job off *worker* before maintenance.
@@ -986,10 +1462,11 @@ class Pool:
             if len(source_jobs) > DRAIN_SOURCE_JOB_LIMIT:
                 raise ValueError("drain source has more than 6 active jobs")
             if (self._draining or self._timed or self._permits
-                    or self._groups or self._stops):
-                # Timed promises, group bookings, stop windows and outstanding
-                # choice permits are not migrated by this evacuation. A legal
-                # request is busy and must not close the source or run prepare.
+                    or self._groups or self._stops or self._artifacts):
+                # Timed promises, group bookings, stop windows, outstanding
+                # choice permits and live batch results are not migrated by
+                # this evacuation. A legal request is busy and must not close
+                # the source or run prepare.
                 return {"status": "busy", "moved": {}}
 
             # The attempt starts here: the source stops accepting new jobs and
@@ -1064,6 +1541,7 @@ class Pool:
                     self._convert_hold(job_holds, holds, job)
                     new_lease = Lease(job, target)
                     self._active[job] = (new_lease, demand)
+                    self._reserve_leases.discard(old_lease)
                     moved[job] = new_lease
         finally:
             with self._lock:

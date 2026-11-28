@@ -17,6 +17,8 @@
 - `GroupTicket(jobs)`：跨故障域成组预约返回的不可变凭据。只含按副本顺序排列的
   作业名元组，没有工位或时刻；激活时同样按**对象身份**围栏，伪造品、外池凭据和
   已失效凭据都不能领用。
+- `Artifact(job)`：发布批处理中间结果返回的不可变凭据。只记生产作业名，真实位置
+  与块内容由池内部跟踪；只接受本池当时发出的原对象。
 
 ## 基础入口
 
@@ -338,6 +340,78 @@ result = pool.drain("a", prepare)
 旧的 `reserve` / `release` / `current` / `available` 入口不引入上文的 8 工位、
 64 单位或 16 条定时记录限制。
 
+## 批处理中间结果交接
+
+生产算子可把成品留在原工位供下游本地读取，或送入容量有限的共享交换区供任意
+工位读取。启用方式是在构造时给出 `exchange_blocks`：
+
+```python
+pool = Pool(workers, exchange_blocks=4)   # 4 块交换容量；0 表示可交接但无交换区
+# 不传 exchange_blocks 则交接功能关闭：publish/start_reader/finish_reader 抛
+# RuntimeError，artifact_location 返回 None，exchange_used 返回 0。
+```
+
+一个块计一单位内存或一单位交换空间，数据是长度 1–64 字节的不可变 `bytes`。
+
+```python
+lease = pool.reserve("prod", Demand(1, 4))          # 普通原始租约
+artifact = pool.publish(lease, (b"a", b"bb", b"ccc", b"dddd"), ("j", "r"))
+# 返回不可伪造的 Artifact；随后原作业解绑、CPU 与未用内存归还，
+# 成品块继续占用生产工位内存，旧租约不能再归还它。
+pool.artifact_location(artifact)                    # ("local", "prod所在工位") 或 ("exchange", None)
+
+reader, inputs = pool.start_reader("j", Demand(3, 4), (artifact,))
+# inputs 是按 artifacts 顺序的块元组，每份内容与发布时完全一致。
+pool.finish_reader(reader)                          # True：确认本次借用的全部结果
+```
+
+### 发布
+
+- `publish(lease, blocks, readers)` 只接受 `reserve` 发出的**当前原始普通租约**；
+  定时、许可领用、读者、迁移产生的租约或已失效租约返回 `None`。
+- `blocks`、`readers` 都是元组；读者是 1–4 个互不相同的非空作业名，发布时不占用
+  这些名字。单份结果 1–8 块，且不超过生产租约的内存；否则抛 `ValueError`。
+- 已存续结果达到 8 份时，合法发布返回 `None`。成品块所在工位的真实内存一直被
+  占用，直到被整体送入交换区或所有登记读者确认成功。
+
+### 启动下游
+
+`start_reader(job, demand, artifacts)` 成功返回 `(lease, inputs)`，失败返回
+`None` 且不改动任何输入位置、用量或待确认集合。调用必须一次传入该作业目前**全部**
+待确认结果（非空、无重复、无伪造/外池/已确认结果），否则返回 `None`；已有同名
+有效作业或预约/许可时抛 `ValueError`。租约的两维需求和标签照旧，工作内存额外
+扣减，不包含成品块。
+
+要在所选工位上同时读到全部输入：留在该工位本地的结果可直接读取，其余本地的
+结果可**整体**转入交换区后读取，交换区的结果可在任意工位读取。规划会用转移与
+分配共同生效后的真实状态比较安排，既算上成品占用的内存，也算上转走后真正空出
+的容量；多种合法安排可任选，不为尚未提出的请求提前迁移。以下情况返回 `None`：
+
+- 单份结果放得下、但整次启动的交换需求放不下（不逐份单独买单）；
+- 某份本地结果正被其他运行中的读者读取，不能挪走，也不在其他工位可读；
+- 没有工位能同时容纳作业并读到全部输入。
+
+### 确认或中止
+
+- `finish_reader(lease)` 对当前原始读者租约返回 `True`：归还本次运行占用并确认
+  它借用的全部结果。只有最后一个登记读者确认后，结果才注销并归还其所在位置的
+  空间。其他租约（含旧运行、伪造物）返回 `False`。
+- 旧 `release(lease)` 对读者租约只中止本次运行：归还运行占用、解除本地读取保护，
+  不确认结果，原作业名可以重试。同名重试后，迟到的旧租约既不能确认也不能归还
+  新的占用。
+- `artifact_location` 对已注销或非本池原凭据返回 `None`；`exchange_used()` 返回
+  实际占用的交换块数。
+
+### 兼容边界
+
+- 普通 `reserve` 仍用原排序，但会看到本地成品占用的内存，也能使用成品转走后
+  空出的容量。新读者属于无结束时刻的普通运行：避开停止接单的工位，也不挤掉
+  已发的定时承诺或选型许可；旧入口的新承诺同样不能挤掉现行读者或本地成品。
+- 有存续结果时合法的 `drain` 返回旧的 `busy` 且不关源；疏散过程中合法的
+  发布和启动返回 `None`。
+- 交接入口的规模边界：1–8 台工位、每维至多 64、交换容量 0–64。超出时
+  `publish` / `start_reader` 抛 `ValueError`；未启用时两个查询无害地返回空值。
+
 ## 典型重试模式
 
 ```python
@@ -359,4 +433,6 @@ while True:
 python3 -B -m unittest -v
 # 只运行跨故障域成组预约与工位停接的验收场景（含简短中文执行摘要）：
 python3 -B -m unittest -v test_group_maintenance
+# 只运行批处理中间结果交接的验收场景：
+python3 -B -m unittest -v test_artifact_handoff
 ```
