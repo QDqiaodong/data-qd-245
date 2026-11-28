@@ -412,6 +412,89 @@ pool.finish_reader(reader)                          # True：确认本次借用�
 - 交接入口的规模边界：1–8 台工位、每维至多 64、交换容量 0–64。超出时
   `publish` / `start_reader` 抛 `ValueError`；未启用时两个查询无害地返回空值。
 
+## 滚动租户预算
+
+同一个池可服务多个批处理租户。工位排得下只说明机器有余量；登记作业还要在
+任意连续 `width` 个 tick 内控制自己消耗的 CPU·tick 与内存·tick，避免一连串
+短作业绕开预算。
+
+```python
+pool = Pool(
+    [Worker("a", 4, 6, frozenset({"a"})), Worker("b", 4, 6, frozenset({"b"}))],
+    tenant_budgets={"batch-team": (4, 8, 11)},   # width, cpu_ticks, memory_ticks
+    metered_jobs={"x": "batch-team", "y": "batch-team"},
+)
+
+booking = pool.book("x", Demand(2, 3, frozenset({"a"})), 0, 4)
+pool.advance(2)
+pool.release(pool.activate(booking))
+# 两台工位此刻都空着，但最近 4 tick 已被计费 (4, 6)。
+```
+
+计费按定时条目**实际占住的区间**累计：对任一整数右端点 `t`，窗口
+`[t - width, t)` 内每个被占用的 tick 都计入该作业完整的 `Demand.cpu` 与
+`Demand.memory`。未激活的预约同样占住整个承诺窗口；提前 `release` 只放弃从
+当前 tick 起的未用部分，已经走过的 tick 继续影响预算直到滑出窗口。
+`pool.tenant_usage(tenant)` 返回截至当前逻辑时刻的 `[now - width, now)` 用量，
+不把未来承诺算进去；未知租户抛 `ValueError`。
+
+准入口径与上报口径一致：候选区间与同租户**已承诺的作业**落入同一窗口时，两者
+的 tick 会一起计费；窗口因此越过预算就拒绝。只有一个候选、窗口里没有其它承诺
+时，这一份区间的最后一个 tick 不反过来阻止它自己被接纳——单次区间本身是调用方
+明确要求的单位，预算约束的是多个区间在窗口内的堆积。区间一旦准入，之后的
+`tenant_usage` 仍按上面的完整窗口口径如实累计。
+
+### 为什么工位空着却会拒绝
+
+```python
+pool.book("y", Demand(2, 3, frozenset({"b"})), 2, 5)
+# → None：窗口 [0, 4) 内 x 的 tick 0-1 与 y 的 tick 2-3 合计
+#   8 CPU·tick、12 内存·tick，超过 11 的内存预算。
+#   工位余量与租户已计费量都不变，合法的 book 不会占用作业名。
+```
+
+预算按租户独立核算、两维不可互换，已占用额度横跨所有工位；`available()` 仍是
+工位真实余量，不会因为租户额度不足而变小。未登记的旧作业不计费，也不受任何
+租户预算限制，但仍与登记作业共享工位容量和作业名。
+
+### 调用方怎样重试
+
+`book` 只因为预算超限拒绝时返回 `None`，调用方可以：
+
+1. **后移开始时刻**，让旧用量滑出滚动窗口：
+
+   ```python
+   retried = pool.book("y", Demand(2, 3, frozenset({"b"})), 3, 6)
+   pool.advance(3)
+   lease = pool.activate(retried)      # 到窗口后正常开工
+   ```
+
+2. **改用回填**：`backfill` 会在旧约束和预算内交付最长的可行前缀；如果最短
+   时长都放不下则返回 `None`，放得下但更长的片段超预算时自动缩短：
+
+   ```python
+   lease, until = pool.backfill("y", Demand(2, 2, frozenset({"a"})), 1, 4)
+   # 只拿到能在预算内兑现的最长片段，until 是实际截止 tick。
+   ```
+
+3. **换一个租户或降低需求**，或推进逻辑时刻后重新尝试。预算拒绝不会写入任何
+   预约、租约或计费记录，因此重试是安全的。
+
+具体可运行示例见 `demo_tenant_budget.py`。
+
+### 规模与参数边界
+
+- 每池至多 **8** 个租户、**32** 个登记作业名；租户名、作业名都必须是非空字符串，
+  `metered_jobs` 只能指向已配置的租户。
+- `width` 是 1–65536 的整数 tick；两维预算各为 0–67108864 的整数。布尔值不算
+  整数，越界或类型非法在构造时抛 `ValueError`。省略或传 `None` 等价于空字典，
+  构造时会复制字典，之后修改原字典不影响池。
+- 登记作业只能通过带租户预算的 `book` / `backfill` 获得运行权。把登记名交给
+  `reserve`、`admit`、`book_group`（组内任一登记名也算）或 `start_reader`
+  会抛 `ValueError` 且不改变池；未启用预算时这些入口行为完全不变。
+- 逻辑时钟可以跳到任意大的非负整数；配额层按事件时间线摘要计算，不会按空闲
+  跨度逐 tick 追赶，连续短作业也不会反复扫描整个宽窗口。
+
 ## 典型重试模式
 
 ```python
@@ -435,4 +518,8 @@ python3 -B -m unittest -v
 python3 -B -m unittest -v test_group_maintenance
 # 只运行批处理中间结果交接的验收场景：
 python3 -B -m unittest -v test_artifact_handoff
+# 只运行滚动租户预算的验收场景（含简短中文执行摘要）：
+python3 -B -m unittest -v test_tenant_budget
+# 可运行的预算拒绝与重试示例：
+python3 -B demo_tenant_budget.py
 ```

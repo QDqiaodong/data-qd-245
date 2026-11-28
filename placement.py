@@ -39,6 +39,13 @@ BLOCKS_PER_ARTIFACT_MAX = 8
 BLOCK_BYTES_MIN = 1
 BLOCK_BYTES_MAX = 64
 
+# Rolling per-tenant budgets cover registered batch jobs only.
+TENANT_LIMIT = 8
+METERED_JOB_LIMIT = 32
+TENANT_WINDOW_MIN = 1
+TENANT_WINDOW_MAX = 65536
+TENANT_BUDGET_MAX = 67108864
+
 
 def _labels(labels):
     return type(labels) is frozenset and all(type(label) is str and label for label in labels)
@@ -162,11 +169,12 @@ class _TimedRecord:
 
     __slots__ = (
         "kind", "job", "demand", "worker", "start", "end",
-        "booking", "lease", "holding", "group",
+        "booking", "lease", "holding", "group", "tenant",
     )
 
     def __init__(self, kind, job, demand, worker, start, end,
-                 booking=None, lease=None, holding=False, group=None):
+                 booking=None, lease=None, holding=False, group=None,
+                 tenant=None):
         self.kind = kind
         self.job = job
         self.demand = demand
@@ -177,6 +185,167 @@ class _TimedRecord:
         self.lease = lease
         self.holding = holding
         self.group = group
+        # Tenant name when this interval is a registered metered job.
+        self.tenant = tenant
+
+
+class _TimelineNode:
+    """One change point in a tenant's per-tick billing rate."""
+
+    __slots__ = ("key", "priority", "delta_cpu", "delta_memory",
+                 "left", "right", "sum_cpu", "sum_memory",
+                 "weighted_cpu", "weighted_memory")
+
+    def __init__(self, key, delta_cpu, delta_memory, priority):
+        self.key = key
+        self.priority = priority
+        self.delta_cpu = delta_cpu
+        self.delta_memory = delta_memory
+        self.left = None
+        self.right = None
+        self.sum_cpu = delta_cpu
+        self.sum_memory = delta_memory
+        self.weighted_cpu = key * delta_cpu
+        self.weighted_memory = key * delta_memory
+
+
+def _node_refresh(node):
+    left = node.left
+    right = node.right
+    sum_cpu = node.delta_cpu
+    sum_memory = node.delta_memory
+    weighted_cpu = node.key * node.delta_cpu
+    weighted_memory = node.key * node.delta_memory
+    if left is not None:
+        sum_cpu += left.sum_cpu
+        sum_memory += left.sum_memory
+        weighted_cpu += left.weighted_cpu
+        weighted_memory += left.weighted_memory
+    if right is not None:
+        sum_cpu += right.sum_cpu
+        sum_memory += right.sum_memory
+        weighted_cpu += right.weighted_cpu
+        weighted_memory += right.weighted_memory
+    node.sum_cpu = sum_cpu
+    node.sum_memory = sum_memory
+    node.weighted_cpu = weighted_cpu
+    node.weighted_memory = weighted_memory
+
+
+def _rotate_right(node):
+    pivot = node.left
+    node.left = pivot.right
+    pivot.right = node
+    _node_refresh(node)
+    _node_refresh(pivot)
+    return pivot
+
+
+def _rotate_left(node):
+    pivot = node.right
+    node.right = pivot.left
+    pivot.left = node
+    _node_refresh(node)
+    _node_refresh(pivot)
+    return pivot
+
+
+def _timeline_add(node, key, delta_cpu, delta_memory, priority):
+    if node is None:
+        return _TimelineNode(key, delta_cpu, delta_memory, priority)
+    if key == node.key:
+        node.delta_cpu += delta_cpu
+        node.delta_memory += delta_memory
+    elif key < node.key:
+        node.left = _timeline_add(
+            node.left, key, delta_cpu, delta_memory, priority)
+        if node.left.priority < node.priority:
+            node = _rotate_right(node)
+            return node
+    else:
+        node.right = _timeline_add(
+            node.right, key, delta_cpu, delta_memory, priority)
+        if node.right.priority < node.priority:
+            node = _rotate_left(node)
+            return node
+    _node_refresh(node)
+    return node
+
+
+def _timeline_prefix(node, key):
+    """Return aggregate deltas at strictly smaller keys.
+
+    The result is ``(sum_cpu, sum_memory, weighted_cpu, weighted_memory)``
+    where weighted values are the corresponding sums multiplied by the key.
+    """
+    sum_cpu = sum_memory = weighted_cpu = weighted_memory = 0
+    while node is not None:
+        if node.key < key:
+            left = node.left
+            if left is not None:
+                sum_cpu += left.sum_cpu
+                sum_memory += left.sum_memory
+                weighted_cpu += left.weighted_cpu
+                weighted_memory += left.weighted_memory
+            sum_cpu += node.delta_cpu
+            sum_memory += node.delta_memory
+            weighted_cpu += node.key * node.delta_cpu
+            weighted_memory += node.key * node.delta_memory
+            node = node.right
+        else:
+            node = node.left
+    return sum_cpu, sum_memory, weighted_cpu, weighted_memory
+
+
+class _TenantRecord:
+    """One tenant's rolling billing profile.
+
+    The timeline holds rate-change events: a committed box ``[start, end)``
+    with per-tick ``(cpu, memory)`` contributes ``+d`` at ``start`` and
+    ``-d`` at ``end``.  The cumulative area up to tick ``x`` is then
+    ``x * sum(delta) - sum(key * delta)`` over events with ``key < x``; the
+    rolling window ``[x - width, x)`` is the difference of two such queries.
+    An event tree gives logarithmic updates and lookups for any clock value
+    and width, with no per-tick catch-up.
+    """
+
+    __slots__ = ("width", "cpu_budget", "memory_budget", "root", "rng")
+
+    def __init__(self, width, cpu_budget, memory_budget):
+        self.width = width
+        self.cpu_budget = cpu_budget
+        self.memory_budget = memory_budget
+        self.root = None
+        self.rng = (0x9E3779B97F4A7C15 + width * 2654435761 + cpu_budget
+                    + (memory_budget << 7)) & ((1 << 64) - 1)
+
+    def _next_priority(self):
+        self.rng = (self.rng * 6364136223846793005 + 1442695040888963407) \
+            & ((1 << 64) - 1)
+        return self.rng
+
+    def add_box(self, start, end, cpu, memory):
+        """Bill ``cpu``/``memory`` per tick over the half-open ``[start,end)``."""
+        if start >= end:
+            return
+        self.root = _timeline_add(
+            self.root, start, cpu, memory, self._next_priority())
+        self.root = _timeline_add(
+            self.root, end, -cpu, -memory, self._next_priority())
+
+    def billed(self, x):
+        """CPU·tick and memory·tick consumed in ``[0, x)``."""
+        if x <= 0:
+            return (0, 0)
+        sum_cpu, sum_memory, weighted_cpu, weighted_memory = \
+            _timeline_prefix(self.root, x)
+        return (x * sum_cpu - weighted_cpu, x * sum_memory - weighted_memory)
+
+    def window(self, now):
+        """CPU·tick and memory·tick consumed in ``[now - width, now)``."""
+        high_cpu, high_memory = self.billed(now)
+        low_cpu, low_memory = self.billed(now - self.width)
+        return (high_cpu - low_cpu, high_memory - low_memory)
 
 
 class _GroupRecord:
@@ -217,7 +386,8 @@ class _PermitRecord:
 
 
 class Pool:
-    def __init__(self, workers, *, fault_domains=None, exchange_blocks=None):
+    def __init__(self, workers, *, fault_domains=None, exchange_blocks=None,
+                 tenant_budgets=None, metered_jobs=None):
         self._workers = {}
         self._free = {}
         for worker in workers:
@@ -248,6 +418,10 @@ class Pool:
                    for domain in fault_domains.values()):
                 raise ValueError("fault domain names must be non-empty strings")
             self._fault_domains = dict(fault_domains)
+        # Optional rolling tenant budgets.  Copies are taken here so later
+        # caller mutation of the original mappings cannot change billing.
+        self._tenants = self._build_tenants_locked(tenant_budgets)
+        self._metered = self._build_metered_locked(metered_jobs, self._tenants)
         self._active = {}
         self._lock = Lock()
         # Workers that no longer accept new jobs (sources of drain attempts).
@@ -279,10 +453,134 @@ class Pool:
         # Blocks currently occupying the shared exchange area.
         self._exchange_used = 0
 
+    # ------------------------------------------------------------------
+    # Rolling tenant budgets: configuration and billing primitives.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_tenants_locked(tenant_budgets):
+        if tenant_budgets is None:
+            return {}
+        if not isinstance(tenant_budgets, dict):
+            raise ValueError("tenant_budgets must be a mapping")
+        if len(tenant_budgets) > TENANT_LIMIT:
+            raise ValueError("too many tenants")
+        tenants = {}
+        for tenant, profile in tenant_budgets.items():
+            if type(tenant) is not str or not tenant:
+                raise ValueError("tenant names must be non-empty strings")
+            if not isinstance(profile, tuple) or len(profile) != 3:
+                raise ValueError("each tenant budget is (width, cpu_ticks, memory_ticks)")
+            width, cpu_ticks, memory_ticks = profile
+            if (any(type(value) is not int
+                    for value in (width, cpu_ticks, memory_ticks))
+                    or not TENANT_WINDOW_MIN <= width <= TENANT_WINDOW_MAX
+                    or not 0 <= cpu_ticks <= TENANT_BUDGET_MAX
+                    or not 0 <= memory_ticks <= TENANT_BUDGET_MAX):
+                raise ValueError("tenant budget values are out of range")
+            tenants[tenant] = _TenantRecord(width, cpu_ticks, memory_ticks)
+        return tenants
+
+    @staticmethod
+    def _build_metered_locked(metered_jobs, tenants):
+        if metered_jobs is None:
+            return {}
+        if not isinstance(metered_jobs, dict):
+            raise ValueError("metered_jobs must be a mapping")
+        if len(metered_jobs) > METERED_JOB_LIMIT:
+            raise ValueError("too many metered jobs")
+        metered = {}
+        for job, tenant in metered_jobs.items():
+            if type(job) is not str or not job:
+                raise ValueError("metered job names must be non-empty strings")
+            if type(tenant) is not str or not tenant or tenant not in tenants:
+                raise ValueError("metered job names an unknown tenant")
+            metered[job] = tenant
+        return metered
+
+    def tenant_usage(self, tenant):
+        """Billed (cpu_ticks, memory_ticks) inside [now - width, now), or raise."""
+        with self._lock:
+            if type(tenant) is not str or tenant not in self._tenants:
+                raise ValueError("unknown tenant")
+            return self._tenants[tenant].window(self._now)
+
+    def _fits_budget_locked(self, tenant, start, end, demand):
+        """Whether one candidate interval fits the tenant's rolling windows.
+
+        Windows are examined at each tick ``t`` after the candidate's start
+        through the committed horizon.  At such a ``t`` the window
+        ``[t - width, t)`` holds the tenant's already committed usage plus the
+        candidate's overlap with it.  The horizon reaches the later of the
+        candidate's end and every live promise of the same tenant, so a future
+        promise is protected even when the candidate itself ends first.
+
+        A candidate's own terminal window (one ending exactly at its end, with
+        no other committed work inside) is not re-charged against itself: one
+        admitted interval is the unit the caller explicitly asked for.  As
+        soon as that window contains other committed work — for example the
+        preceding run of short jobs — it is checked in full.  Every other
+        shared window is always checked.
+
+        Live promise spans stay within the 64-tick timed envelope, so this
+        stays small at any logical clock value.
+        """
+        profile = self._tenants[tenant]
+        # One tick of the candidate alone must already be affordable.
+        if (demand.cpu > profile.cpu_budget
+                or demand.memory > profile.memory_budget):
+            return False
+        width = profile.width
+        last = end
+        for record in self._timed:
+            if record.tenant == tenant and record.end > last:
+                last = record.end
+        for tick in range(start + 1, last + 1):
+            used_cpu, used_memory = profile.window(tick)
+            if tick == end == last and not used_cpu and not used_memory:
+                continue
+            span = min(tick, end) - max(tick - width, start)
+            if span > 0:
+                used_cpu += span * demand.cpu
+                used_memory += span * demand.memory
+            if (used_cpu > profile.cpu_budget
+                    or used_memory > profile.memory_budget):
+                return False
+        return True
+
+    def _budget_prefix_length_locked(self, tenant, demand, max_ticks, floor):
+        """Longest prefix ``[now, now+length)`` the budget admits, or 0.
+
+        Feasibility is monotone in the prefix length, so a binary search finds
+        the longest budget-allowed segment at ``floor .. max_ticks``.
+        """
+        if not self._fits_budget_locked(
+                tenant, self._now, self._now + floor, demand):
+            return 0
+        low, high = floor, max_ticks
+        while low < high:
+            middle = (low + high + 1) // 2
+            if self._fits_budget_locked(
+                    tenant, self._now, self._now + middle, demand):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def _commit_budget_locked(self, tenant, start, end, demand):
+        self._tenants[tenant].add_box(
+            start, end, demand.cpu, demand.memory)
+
+    def _reject_metered_entry(self, names):
+        """Registered metered jobs may run only through budgeted timed entries."""
+        if any(name in self._metered for name in names):
+            raise ValueError("metered job cannot run without a timed budget")
+
     def reserve(self, job, demand):
         """Atomically reserve both dimensions, or return None without consuming either."""
         if type(job) is not str or not job or not isinstance(demand, Demand):
             raise ValueError("invalid job or demand")
+        self._reject_metered_entry((job,))
         with self._lock:
             if (job in self._active or job in self._timed_by_job
                     or job in self._permit_by_job):
@@ -341,6 +639,7 @@ class Pool:
                or option.memory > PERMIT_DIMENSION_LIMIT
                for option in options):
             raise ValueError("each permit option may request at most 64 units per dimension")
+        self._reject_metered_entry((job,))
 
         permit = Permit(job)
         with self._lock:
@@ -591,6 +890,13 @@ class Pool:
             if len(self._timed) >= MAX_TIMED_RECORDS:
                 return None
 
+            tenant = self._metered.get(job)
+            # A registered job must fit its tenant's rolling budget before any
+            # capacity is chosen; a budget-only refusal consumes nothing.
+            if tenant is not None and not self._fits_budget_locked(
+                    tenant, start, end, demand):
+                return None
+
             chosen = None
             for name in sorted(self._workers):
                 if name in self._closed:
@@ -607,7 +913,10 @@ class Pool:
             booking = Booking(job, chosen, start, end)
             record = _TimedRecord(
                 "booking", job, demand, chosen, start, end, booking=booking,
+                tenant=tenant,
             )
+            if tenant is not None:
+                self._commit_budget_locked(tenant, start, end, demand)
             if start == self._now:
                 self._deduct_current_locked(chosen, demand)
                 record.holding = True
@@ -668,6 +977,7 @@ class Pool:
                 raise ValueError("invalid replica job or demand")
             jobs.append(job)
             demands.append(demand)
+        self._reject_metered_entry(jobs)
         if type(start) is not int or type(end) is not int:
             raise ValueError("start and end must be integers")
         if not (start < end):
@@ -873,6 +1183,16 @@ class Pool:
             if len(self._timed) >= MAX_TIMED_RECORDS:
                 return None
 
+            tenant = self._metered.get(job)
+            # The budget is tenant-wide, so its longest admissible prefix is
+            # independent of the worker; each worker then delivers the shorter
+            # of that prefix and its physically safe prefix.
+            budget_length = max_ticks
+            if tenant is not None:
+                budget_length = self._budget_prefix_length_locked(
+                    tenant, demand, max_ticks, min_ticks)
+                if budget_length < min_ticks:
+                    return None
             best = None  # (length, name, until)
             for name in sorted(self._workers):
                 if name in self._closed:
@@ -884,7 +1204,10 @@ class Pool:
                 )
                 if until is None:
                     continue
-                length = until - self._now
+                length = min(until - self._now, budget_length)
+                if length < min_ticks:
+                    continue
+                until = self._now + length
                 # Sorted iteration plus strict > keeps the smallest worker name
                 # among equal maximum lengths. The spec permits any worker rule.
                 if best is None or length > best[0]:
@@ -896,8 +1219,10 @@ class Pool:
             lease = Lease(job, name)
             record = _TimedRecord(
                 "backfill", job, demand, name, self._now, until,
-                lease=lease, holding=True,
+                lease=lease, holding=True, tenant=tenant,
             )
+            if tenant is not None:
+                self._commit_budget_locked(tenant, self._now, until, demand)
             self._deduct_current_locked(name, demand)
             self._active[job] = (lease, demand)
             self._timed.append(record)
@@ -1021,6 +1346,9 @@ class Pool:
             timed = self._timed_by_job.get(lease.job)
             if timed is not None and timed.lease is current_lease:
                 # Early release abandons the remainder of the fixed interval.
+                # Metered time already walked stays billed, and a partial
+                # prefix of a backfill is billed only through this tick.
+                self._abandon_billed_locked(timed)
                 self._remove_timed_locked(timed)
             else:
                 used = self._ordinary_use[lease.worker]
@@ -1030,6 +1358,18 @@ class Pool:
             # A replica release may be the last live member of its batch.
             self._sweep_groups_locked()
             return True
+
+    def _abandon_billed_locked(self, record):
+        """Stop billing the never-walked remainder of a released interval.
+
+        A successful early return gives up only the commitment from the
+        current tick onward; every tick already walked keeps counting against
+        later rolling windows until it slides out.
+        """
+        if record.tenant is None:
+            return
+        self._tenants[record.tenant].add_box(
+            self._now, record.end, -record.demand.cpu, -record.demand.memory)
 
     def available(self):
         """Real unoccupied and unreserved units, including workers that reject new jobs."""
@@ -1145,6 +1485,7 @@ class Pool:
             raise ValueError("duplicate input artifact")
         if len(artifacts) > MAX_READER_INPUTS:
             raise ValueError("one reader may wait on at most four results")
+        self._reject_metered_entry((job,))
 
         with self._lock:
             # The job name is exclusive with every other live binding; adding
